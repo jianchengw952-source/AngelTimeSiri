@@ -2975,78 +2975,73 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 }
 
 // ==================== L2 级：开屏广告秒跳看门狗 (Vision 神经 OCR + 硬件级秒触控) ====================
-static void agStartAdBypassWatchdogWithContinuation(void (^completion)(BOOL skipped)) {
-    __block NSInteger checksRemaining = 16; // 16 次 * 0.22s = 最多监视 ~3.5 秒
-    __block BOOL didFindAd = NO;
+static void agPerformAdBypassCheck(NSInteger remainingChecks, void (^completion)(BOOL skipped)) {
+    if (remainingChecks <= 0) {
+        if (completion) completion(NO);
+        return;
+    }
 
-    void (^__block checkPass)(void) = ^{
-        if (didFindAd || checksRemaining <= 0) {
-            if (completion) completion(didFindAd);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        UIImage *screenImg = _UICreateScreenUIImage();
+        if (!screenImg || !screenImg.CGImage) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                agPerformAdBypassCheck(remainingChecks - 1, completion);
+            });
             return;
         }
-        checksRemaining--;
 
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-            UIImage *screenImg = _UICreateScreenUIImage();
-            if (!screenImg || !screenImg.CGImage) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    checkPass();
-                });
-                return;
-            }
+        CGImageRef cgImg = screenImg.CGImage;
+        CGImageRetain(cgImg);
+        CGRect sb = [UIScreen mainScreen].bounds;
 
-            CGImageRef cgImg = screenImg.CGImage;
-            CGImageRetain(cgImg);
-            CGRect sb = [UIScreen mainScreen].bounds;
+        VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
+            CGPoint skipTapPoint = CGPointZero;
+            BOOL found = NO;
 
-            VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
-                CGPoint skipTapPoint = CGPointZero;
-                BOOL found = NO;
-
-                for (VNRecognizedTextObservation *obs in request.results) {
-                    CGRect box = obs.boundingBox;
-                    // 开屏广告跳过按钮通常在屏幕顶部 40% 区域（Vision 坐标系 Y: 0.60 ~ 1.0）
-                    if (box.origin.y + box.size.height >= 0.60) {
-                        VNRecognizedText *top = [[obs topCandidates:1] firstObject];
-                        if (top) {
-                            NSString *str = [[top.string stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
-                            if ([str containsString:@"跳过"] || [str containsString:@"skip"] || [str isEqualToString:@"x"] || [str isEqualToString:@"×"] || [str containsString:@"关闭"]) {
-                                CGFloat tapX = CGRectGetMidX(box) * sb.size.width;
-                                CGFloat tapY = (1.0 - CGRectGetMidY(box)) * sb.size.height;
-                                skipTapPoint = CGPointMake(tapX, tapY);
-                                found = YES;
-                                break;
-                            }
+            for (VNRecognizedTextObservation *obs in request.results) {
+                CGRect box = obs.boundingBox;
+                // 开屏广告跳过按钮通常在屏幕顶部 40% 区域（Vision 坐标系 Y: 0.60 ~ 1.0）
+                if (box.origin.y + box.size.height >= 0.60) {
+                    VNRecognizedText *top = [[obs topCandidates:1] firstObject];
+                    if (top) {
+                        NSString *str = [[top.string stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                        if ([str containsString:@"跳过"] || [str containsString:@"skip"] || [str isEqualToString:@"x"] || [str isEqualToString:@"×"] || [str containsString:@"关闭"]) {
+                            CGFloat tapX = CGRectGetMidX(box) * sb.size.width;
+                            CGFloat tapY = (1.0 - CGRectGetMidY(box)) * sb.size.height;
+                            skipTapPoint = CGPointMake(tapX, tapY);
+                            found = YES;
+                            break;
                         }
                     }
                 }
+            }
 
-                CGImageRelease(cgImg);
+            CGImageRelease(cgImg);
 
-                if (found) {
-                    didFindAd = YES;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        agLiveDiagLog(@"AD_WATCHDOG", @"Detected ad skip button, tapping at (%.1f, %.1f)", skipTapPoint.x, skipTapPoint.y);
-                        agSimulateScreenTapAtPoint(skipTapPoint);
-                        [[AGGlobalActionPillWindow sharedPill] showActionPill:@"⚡ 已为您自动秒跳开屏广告"];
-                        if (completion) completion(YES);
-                    });
-                } else {
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        checkPass();
-                    });
-                }
-            }];
-            req.recognitionLevel = VNRequestTextRecognitionLevelFast;
-            req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
-            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImg options:@{}];
-            [handler performRequests:@[req] error:nil];
-        });
-    };
+            if (found) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    agLiveDiagLog(@"AD_WATCHDOG", @"Detected ad skip button, tapping at (%.1f, %.1f)", skipTapPoint.x, skipTapPoint.y);
+                    agSimulateScreenTapAtPoint(skipTapPoint);
+                    [[AGGlobalActionPillWindow sharedPill] showActionPill:@"⚡ 已为您自动秒跳开屏广告"];
+                    if (completion) completion(YES);
+                });
+            } else {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    agPerformAdBypassCheck(remainingChecks - 1, completion);
+                });
+            }
+        }];
+        req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+        req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImg options:@{}];
+        [handler performRequests:@[req] error:nil];
+    });
+}
 
+static void agStartAdBypassWatchdogWithContinuation(void (^completion)(BOOL skipped)) {
     // 延迟 0.35s 等待目标 App 渲染首帧后开始轮询
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        checkPass();
+        agPerformAdBypassCheck(16, completion);
     });
 }
 
@@ -7002,7 +6997,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         timerRe = [NSRegularExpression regularExpressionWithPattern:@"(?:定个|设个|设置|开启|来个)?(\\d{1,3})(?:分钟|分|秒)(?:的)?(?:倒计时|计时器)" options:0 error:nil];
         alarmRe = [NSRegularExpression regularExpressionWithPattern:@"(?:定个|设个|设置|定一个)?(?:明天|明早|早上|上午|下午|晚上)?(\\d{1,2})(?:点|时|:|：)(?:(\\d{1,2})分?)?(?:的)?闹钟" options:0 error:nil];
         tapTextRe = [NSRegularExpression regularExpressionWithPattern:@"(?:点击|点一下)(?:屏幕上的|按钮)?[“\"'「]?([^”\"'」，。！？,.!?\\s]+)[”\"'」]?" options:0 error:nil];
-        searchRegex = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:打开|启动|在|去|用|上)?([^，。！？,.!?\\s”"'\\d]{1,10}?)(?:里|上|app|软件|客户端)?)?(?:搜一下|搜索一下|查找一下|找一下|搜索|搜|找|买|看)(?:一下|个|点|部|台|件|张|本)?(.+)$" options:0 error:nil];
+        searchRegex = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:打开|启动|在|去|用|上)?([^，。！？,.!?\\s\\x22\\x27\\d]{1,10}?)(?:里|上|app|软件|客户端)?)?(?:搜一下|搜索一下|查找一下|找一下|搜索|搜|找|买|看)(?:一下|个|点|部|台|件|张|本)?(.+)$" options:0 error:nil];
         naviRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:打开|用|使用)?(?:高德地图|百度地图|苹果地图|高德|百度|地图)?(?:帮我)?(?:导航|驾车|骑行|步行)?(?:到|去|前往|去往)(.+?)(?:怎么走|怎么去|吧|呢)?$" options:0 error:nil];
         musicRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:在网易云|在qq音乐|听|播放)(?:搜|播|听)?([^，。！？,.!?\\s]+)" options:0 error:nil];
         openRegex = [NSRegularExpression regularExpressionWithPattern:@"^(?:打开|启动|开启)([^，。！？,.!?\\s”\"']+)$" options:0 error:nil];
@@ -8147,8 +8142,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
                         // 延迟 0.25s 触发回车搜索
                         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            if (kb && [kb respondsToSelector:@selector(handleKeyWithString:)]) {
-                                [kb handleKeyWithString:@"\n"];
+                            if (kb && [kb respondsToSelector:@selector(insertText:)]) {
+                                [kb insertText:@"\n"];
                             }
                         });
                     });
@@ -8344,9 +8339,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             } @catch (NSException *e) {}
         });
         // 启动 L2 广告看门狗，跳过后执行 L3 视觉搜索
-        agStartAdBypassWatchdogWithContinuation:^(BOOL skipped) {
+        agStartAdBypassWatchdogWithContinuation(^(BOOL skipped) {
             [self performVisualSearchForKeyword:cleanKw appName:platform];
-        };
+        });
         return;
     }
 
