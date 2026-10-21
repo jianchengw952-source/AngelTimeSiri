@@ -3101,6 +3101,12 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, assign) NSUInteger rxAudioPacketsCount;
 @property (nonatomic, assign) NSUInteger txVideoFramesCount;
 @property (nonatomic, strong) NSMutableString *currentVoiceQueryBuffer;
+@property (nonatomic, strong) NSTimer *wsKeepAlivePingTimer;
+@property (nonatomic, assign) NSTimeInterval lastDismissTimestamp;
+@property (nonatomic, assign) BOOL isWarmStandbyMode;
+- (void)suspendVoiceSessionKeepWebSocketAlive;
+- (void)prewarmWebSocketInBackgroundIfNeeded;
+- (void)flushPreRollPCMBufferIfNeeded;
 - (void)showActionBanner:(NSString *)msg;
 - (void)checkDeferredVoiceLocalCommand;
 - (BOOL)tryExecuteDirectLocalCommand:(NSString *)cmdText;
@@ -3122,6 +3128,16 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         [mgr applyMarqueeThemeColors:agCurrentVisualTheme()];
         [mgr stepMarqueeAnimationWithPhase:mgr.wavePhase voiceAmp:mgr.currentVoiceAmplitude];
         [mgr.cardBgCanvas rebuildStaticGlassShellTextureIfNeeded];
+    });
+}
+
+static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // 当屏幕点亮且未处于锁屏黑屏态时，后台静默预连 WebSocket
+        GeminiAssistantManager *mgr = [GeminiAssistantManager sharedManager];
+        if ([mgr isTweakEnabled] && (!mgr.overlayWindow || mgr.overlayWindow.hidden)) {
+            [mgr prewarmWebSocketInBackgroundIfNeeded];
+        }
     });
 }
 
@@ -3222,6 +3238,15 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         };
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillShow:) name:UIKeyboardWillShowNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillHide:) name:UIKeyboardWillHideNotification object:nil];
+
+        // 亮屏或应用回到前台时，后台静默预热 WebSocket 连接（不开启音频，0 耗电实现呼出即说）
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(prewarmWebSocketInBackgroundIfNeeded) name:UIApplicationDidBecomeActiveNotification object:nil];
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        (__bridge const void *)(self),
+                                        agScreenWakePrewarmCallback,
+                                        CFSTR("com.apple.springboard.hasBlankedScreen"),
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
 
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             [self preloadInstalledAppsCache];
@@ -5222,7 +5247,87 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
     killNativeSiriAudioDaemon();
 }
 
+// 亮屏/后台静默预连：只建立 WebSocket 与 setup 握手，绝不启动 AVAudioEngine，不影响音量与嘿 Siri
+- (void)prewarmWebSocketInBackgroundIfNeeded {
+    if (![self isTweakEnabled]) return;
+    if (self.activeModeTab == AGConfigTabPureText || self.activeModeTab == AGConfigTabTranslation) return;
+    if (self.isWebSocketConnected && self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
+        return; // 已在线，无需重复连接
+    }
+    NSString *model = agModelForTab(self.activeModeTab);
+    NSString *apiKey = agAPIKeyForTab(self.activeModeTab);
+    if (model.length == 0 || apiKey.length < 4) return;
+    if (!agIsWebSocketBidiCapableModel(model, self.activeModeTab)) return;
+
+    self.isWarmStandbyMode = YES;
+    self.lastDismissTimestamp = [[NSDate date] timeIntervalSince1970];
+    self.activeWebSocketModel = model;
+    agLiveDiagLog(@"WS_PREWARM", @"Pre-warming WebSocket in background for model %@", model);
+    [self startWebSocketBidiSessionWithModel:model forTab:self.activeModeTab];
+}
+
+// 关闭窗口时挂起音频硬件归还系统，但保持 WebSocket 24 小时后台智能热备与续杯
+- (void)suspendVoiceSessionKeepWebSocketAlive {
+    self.isWarmStandbyMode = YES;
+    self.lastDismissTimestamp = [[NSDate date] timeIntervalSince1970];
+    self.pendingPlayBuffersCount = 0;
+    self.aiPlaybackEndTime = 0;
+    [self.meterTimer invalidate];
+    self.meterTimer = nil;
+    [self setWaveBarsLevel:0.0];
+
+    AVAudioEngine *eng = self.liveAudioEngine;
+    AVAudioPlayerNode *pl = self.pcmPlayerNode;
+    self.liveAudioEngine = nil;
+    self.pcmPlayerNode = nil;
+
+    // 彻底释放麦克风与 VoiceProcessing，切回 Ambient 模式，100% 不影响手机原本音量与“嘿 Siri”
+    dispatch_async(agAudioSerialQueue(), ^{
+        @try {
+            if (eng) {
+                [eng.inputNode removeTapOnBus:0];
+                if ([eng.inputNode respondsToSelector:@selector(setVoiceProcessingEnabled:error:)]) {
+                    [eng.inputNode setVoiceProcessingEnabled:NO error:nil];
+                }
+                if (pl && pl.isPlaying) [pl stop];
+                if (eng.isRunning) [eng stop];
+            }
+            AVAudioSession *session = [AVAudioSession sharedInstance];
+            [session setCategory:AVAudioSessionCategoryAmbient withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+            [session setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+        } @catch (NSException *e) {}
+    });
+
+    [self.wsKeepAlivePingTimer invalidate];
+    __weak typeof(self) weakSelf = self;
+    self.wsKeepAlivePingTimer = [NSTimer scheduledTimerWithTimeInterval:18.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { [timer invalidate]; return; }
+        if (strongSelf.isWebSocketConnected && strongSelf.liveWebSocketTask && strongSelf.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
+            [strongSelf.liveWebSocketTask sendPingWithPongReceiveHandler:^(NSError * _Nullable error) {
+                if (error) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        strongSelf.isWebSocketConnected = NO;
+                        strongSelf.isSetupHandshakeCompleted = NO;
+                        // 若当前未锁屏，立即在后台静默续杯重连，保证用户随时呼出 0 秒可用
+                        if (!isDeviceCurrentlyLocked()) {
+                            [strongSelf prewarmWebSocketInBackgroundIfNeeded];
+                        }
+                    });
+                }
+            }];
+        } else if (!isDeviceCurrentlyLocked() && strongSelf.isWarmStandbyMode) {
+            // 服务端 15 分钟到期断开后，亮屏状态下自动静默重连续杯
+            [strongSelf prewarmWebSocketInBackgroundIfNeeded];
+        }
+    }];
+    agLiveDiagLog(@"WS_WARM_STANDBY", @"Suspended audio & keeping WebSocket alive with 18s heartbeat");
+}
+
 - (void)stopAllVoiceEngines {
+    [self.wsKeepAlivePingTimer invalidate];
+    self.wsKeepAlivePingTimer = nil;
+    self.isWarmStandbyMode = NO;
     self.sessionGenerationToken++;
     self.currentTurnPlaybackID++;
     self.pendingPlayBuffersCount = 0;
@@ -5269,7 +5374,6 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
     self.activeUtteranceCount = 0;
     self.hasDetectedSpeech = NO;
 
-    // 关键优化：如果当前原本就没有任何活动中的音频引擎或录音机，直接返回，不触发多余的 AVAudioSession 路由切换！
     if (!rec && !eng && !wasSpeakingTTS && !hadActiveWS) {
         return;
     }
@@ -5282,6 +5386,9 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         @try {
             if (eng) {
                 [eng.inputNode removeTapOnBus:0];
+                if ([eng.inputNode respondsToSelector:@selector(setVoiceProcessingEnabled:error:)]) {
+                    [eng.inputNode setVoiceProcessingEnabled:NO error:nil];
+                }
                 if (pl) [pl stop];
                 [eng stop];
             }
@@ -5298,26 +5405,29 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
 
 - (void)startAdaptiveVoiceSessionForTab:(AGConfigTab)tab {
     ensureSpringBoardTCCGranted();
-    [self stopAllVoiceEngines];
     pauseBackgroundMediaPlayback();
+    self.isDismissed = NO;
+    self.isWarmStandbyMode = NO;
     self.wsReconnectCount = 0;
     self.disableTranscriptionInSetup = NO;
     self.hasAutoMigratedDeprecatedModel = NO;
 
+    NSString *curModel = agModelForTab(tab);
+    // 关键优化：如果后台热备或预热的 WebSocket 已经连着同一个模型，绝不调用 stopAllVoiceEngines 掐断它！直接 0 秒无缝接通麦克风！
+    if ((tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI) &&
+        curModel.length > 0 &&
+        self.liveWebSocketTask &&
+        self.liveWebSocketTask.state == NSURLSessionTaskStateRunning &&
+        [self.activeWebSocketModel isEqualToString:curModel]) {
+        [self startWebSocketBidiSessionWithModel:curModel forTab:tab];
+        return;
+    }
+
+    [self stopAllVoiceEngines];
     [self ensureCloudModelsLoadedForTab:tab completion:^(NSString *readyModel) {
         if (tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI || agIsWebSocketBidiCapableModel(readyModel, tab)) {
             NSString *targetModel = readyModel;
-            if (!agIsWebSocketBidiCapableModel(targetModel, tab)) {
-                for (NSDictionary *m in agCachedModelsForTab(tab)) {
-                    if ([m[@"bidi"] boolValue]) {
-                        targetModel = m[@"id"];
-                        break;
-                    }
-                }
-            }
-            if (!targetModel || targetModel.length == 0 || !agIsWebSocketBidiCapableModel(targetModel, tab)) {
-                targetModel = @"models/gemini-2.5-flash-native-audio-preview-09-2025";
-            }
+            if (!targetModel || targetModel.length == 0) return;
             self.activeWebSocketModel = targetModel;
             [self startWebSocketBidiSessionWithModel:targetModel forTab:tab];
         } else {
@@ -5337,27 +5447,44 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
     }
 
     NSString *cleanModel = [modelPath stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (cleanModel.length == 0) {
-        cleanModel = @"models/gemini-2.5-flash-native-audio-preview-09-2025";
-    }
+    if (cleanModel.length == 0) return;
     self.activeWebSocketModel = cleanModel;
     NSString *exactModelID = [cleanModel stringByReplacingOccurrencesOfString:@"models/" withString:@""];
+
+    // 情况 A：后台热备 WebSocket 已完成握手（或正在握手），0.00 秒瞬时复用并直接打开麦克风收音！
+    if (self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning && [self.activeWebSocketModel isEqualToString:cleanModel]) {
+        if (!self.isWarmStandbyMode && self.overlayWindow && !self.overlayWindow.hidden) {
+            [self setupAndStartFullDuplexPCMAudioEngine];
+            if (self.isSetupHandshakeCompleted) {
+                self.subStatusLabel.text = (tab == AGConfigTabVideoAI)
+                    ? @"📞📹 实时视频通话已就绪 (请直接说话)..."
+                    : @"📞 实时语音通话已就绪 (请直接说话)...";
+                agLiveDiagLog(@"WS_FAST_REUSE", @"0ms instant reuse of warm WebSocket for %@", exactModelID);
+            } else {
+                self.subStatusLabel.text = @"🎙️ 请直接说话 (正在同步云端通道)...";
+            }
+        }
+        return;
+    }
 
     self.isGoogleBidiProtocol = agIsGoogleNativeProtocol(endpoint, cleanModel);
     self.isSetupHandshakeCompleted = NO;
     self.aiPlaybackEndTime = 0;
-    self.subStatusLabel.text = [NSString stringWithFormat:@"📞 正在连接 %@ 实时通话 (%@)...", [self currentVendorBrandName], exactModelID];
+
+    // 情况 B：若当前是用户呼出主界面（非后台静默预连），第 0.00 秒立即启动麦克风引擎进入预录状态，用户无需等待即可开口说话！
+    if (!self.isWarmStandbyMode && self.overlayWindow && !self.overlayWindow.hidden && self.activeModeTab != AGConfigTabPureText) {
+        self.subStatusLabel.text = @"🎙️ 请直接开口说话 (已开启 0 秒预录收音)...";
+        [self setupAndStartFullDuplexPCMAudioEngine];
+    }
 
     NSMutableURLRequest *wsReq = nil;
     if (self.isGoogleBidiProtocol) {
-        // 100% 保持现有 Gemini WebSocket 地址与连接方式不变
         NSString *hostBase = [[endpoint stringByReplacingOccurrencesOfString:@"https://" withString:@"wss://"] stringByReplacingOccurrencesOfString:@"http://" withString:@"ws://"];
         NSString *encodedKey = [apiKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: apiKey;
         NSString *wsURLStr = [NSString stringWithFormat:@"%@/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=%@", hostBase, encodedKey];
         NSURL *wsURL = [NSURL URLWithString:wsURLStr];
         if (wsURL) wsReq = [NSMutableURLRequest requestWithURL:wsURL];
     } else {
-        // 新增模型：通过独立协议适配器构建 DashScope / 智谱 / 阶跃星辰 / OpenAI 官方 WebSocket 请求
         wsReq = agBuildVendorWebSocketRequest(endpoint, exactModelID, apiKey);
     }
 
@@ -5375,19 +5502,11 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         self.webSocketSession = nil;
     }
 
-    NSUInteger launchToken = ++self.sessionGenerationToken;
+    ++self.sessionGenerationToken;
     self.webSocketSession = agCreateSessionWithProxy(proxy, self, [NSOperationQueue mainQueue]);
     self.liveWebSocketTask = [self.webSocketSession webSocketTaskWithRequest:wsReq];
     [self.liveWebSocketTask resume];
     [self receiveNextWebSocketMessage];
-
-    // 仅在此处唯一一次启动音频引擎，杜绝并发二次创建 AVAudioEngine 导致安全模式崩溃！
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (launchToken != self.sessionGenerationToken) return;
-        if (self.overlayWindow && !self.overlayWindow.hidden && self.activeModeTab != AGConfigTabPureText && self.liveWebSocketTask) {
-            [self setupAndStartFullDuplexPCMAudioEngine];
-        }
-    });
 }
 
 - (void)URLSession:(NSURLSession *)session webSocketTask:(NSURLSessionWebSocketTask *)webSocketTask didOpenWithProtocol:(NSString *)protocol {
@@ -5499,9 +5618,18 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
     NSString *reasonStr = reason ? [[NSString alloc] initWithData:reason encoding:NSUTF8StringEncoding] : @"无详细原因";
     agLiveDiagLog(@"WS_CLOSED", @"Server closed WebSocket: code=%ld, reason=%@", (long)closeCode, reasonStr);
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!self.overlayWindow || self.overlayWindow.hidden || self.activeModeTab == AGConfigTabPureText) return;
         self.isWebSocketConnected = NO;
         self.isSetupHandshakeCompleted = NO;
+        // 若在后台热备期间被服务端 10~15 分钟超时断开，且手机当前未锁屏，自动静默续杯重连
+        if (self.isWarmStandbyMode || !self.overlayWindow || self.overlayWindow.hidden) {
+            if (!isDeviceCurrentlyLocked()) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self prewarmWebSocketInBackgroundIfNeeded];
+                });
+            }
+            return;
+        }
+        if (self.activeModeTab == AGConfigTabPureText) return;
         self.subStatusLabel.text = [NSString stringWithFormat:@"⚠️ 实时连接关闭 (Code %ld): %@", (long)closeCode, reasonStr];
     });
 }
@@ -5574,6 +5702,33 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
     }];
 }
 
+// 将握手期间用户已经开口说的预录语音一次性丝滑发给大模型，实现 0 秒开口不漏字
+- (void)flushPreRollPCMBufferIfNeeded {
+    NSData *preRoll = nil;
+    @synchronized (self.wsPreRollPCMBuffer) {
+        if (self.wsPreRollPCMBuffer.length > 0) {
+            preRoll = [self.wsPreRollPCMBuffer copy];
+            [self.wsPreRollPCMBuffer setLength:0];
+        }
+    }
+    if (!preRoll || preRoll.length == 0) return;
+
+    NSUInteger chunkSz = 3200;
+    for (NSUInteger offset = 0; offset < preRoll.length; offset += chunkSz) {
+        NSUInteger thisLen = MIN(chunkSz, preRoll.length - offset);
+        NSData *sub = [preRoll subdataWithRange:NSMakeRange(offset, thisLen)];
+        NSString *b64 = [sub base64EncodedStringWithOptions:0];
+        if (self.isGoogleBidiProtocol) {
+            [self sendJSONDictionaryOverWebSocket:@{
+                @"realtimeInput": @{ @"audio": @{ @"mimeType": @"audio/pcm;rate=16000", @"data": b64 } }
+            }];
+        } else {
+            [self sendJSONDictionaryOverWebSocket:agBuildVendorAudioAppendPacket(b64)];
+        }
+    }
+    agLiveDiagLog(@"PREROLL_SENT", @"Flushed %lu bytes of pre-roll audio on setupComplete", (unsigned long)preRoll.length);
+}
+
 - (void)handleIncomingWebSocketJSON:(NSDictionary *)json {
     if (json[@"error"]) {
         NSString *errMsg = json[@"error"][@"message"] ?: @"实时流模型返回错误";
@@ -5583,19 +5738,20 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         return;
     }
 
-    // 1. Google Gemini setupComplete 或 非 Google 模型的 session.updated 确认完成握手
     if ([json[@"type"] isEqualToString:@"session.created"]) {
         agLiveDiagLog(@"WS_SESSION_CREATED", @"Received session.created for %@, waiting for session.updated...", self.activeWebSocketModel);
-        // 兼容部分不回传 session.updated 的中转网关：延迟 0.65 秒兜底解锁音频上推
         NSUInteger capturedToken = self.sessionGenerationToken;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (capturedToken == self.sessionGenerationToken && self.isWebSocketConnected && !self.isSetupHandshakeCompleted) {
                 self.isSetupHandshakeCompleted = YES;
                 self.wsReconnectCount = 0;
+                [self flushPreRollPCMBufferIfNeeded];
                 agLiveDiagLog(@"WS_SETUP_COMPLETE", @"Handshake completed (timer fallback) for model %@", self.activeWebSocketModel);
-                self.subStatusLabel.text = (self.activeModeTab == AGConfigTabVideoAI)
-                    ? @"📞📹 实时视频通话中 (直接说话，支持随时插话打断)..."
-                    : @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
+                if (!self.isWarmStandbyMode) {
+                    self.subStatusLabel.text = (self.activeModeTab == AGConfigTabVideoAI)
+                        ? @"📞📹 实时视频通话中 (直接说话，支持随时插话打断)..."
+                        : @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
+                }
             }
         });
         return;
@@ -5605,15 +5761,14 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         if (!self.isSetupHandshakeCompleted) {
             self.isSetupHandshakeCompleted = YES;
             self.wsReconnectCount = 0;
+            [self flushPreRollPCMBufferIfNeeded];
             agLiveDiagLog(@"WS_SETUP_COMPLETE", @"Handshake completed for model %@", self.activeWebSocketModel);
-            self.subStatusLabel.text = (self.activeModeTab == AGConfigTabVideoAI)
-                ? @"📞📹 实时视频通话中 (直接说话，支持随时插话打断)..."
-                : @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
-            if ([self currentTabTranscript].length == 0 && self.isGoogleBidiProtocol) {
-                [self sendJSONDictionaryOverWebSocket:@{
-                    @"realtimeInput": @{ @"text": @"你好，请用一句简短自然的话主动向我打招呼。" }
-                }];
+            if (!self.isWarmStandbyMode) {
+                self.subStatusLabel.text = (self.activeModeTab == AGConfigTabVideoAI)
+                    ? @"📞📹 实时视频通话中 (直接说话，支持随时插话打断)..."
+                    : @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
             }
+            // 已彻底移除自动发送“你好，请用一句简短自然的话主动向我打招呼”，绝不抢占用户开口时机！
         }
         return;
     }
@@ -6040,9 +6195,7 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
             }
         }
 
-        if (!strongSelf.isWebSocketConnected || !strongSelf.isSetupHandshakeCompleted) return;
-
-        // Google Bidi 固定 16kHz；非 Google 模型根据厂商官方协议自动选择 16kHz (阿里 Qwen / 智谱 GLM) 或 24kHz (OpenAI / 阶跃星辰)
+        // 先完成重采样，若 WebSocket 尚未完成 setupComplete 握手，将用户刚开口的话存入预录缓冲区（最多保留最近 3 秒语音），绝不丢弃！
         double targetRate = strongSelf.isGoogleBidiProtocol
             ? 16000.0
             : agVendorTargetInputSampleRate(agEndpointForTab(strongSelf.activeModeTab), strongSelf.activeWebSocketModel);
@@ -6059,6 +6212,17 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
             float sample = (float)((1.0 - (srcIdx - idx0)) * floatSamples[idx0] + (srcIdx - idx0) * floatSamples[idx1]) * 1.95f;
             sample = MAX(-1.0f, MIN(1.0f, sample));
             outPtr[i] = (int16_t)(sample * 32767.0f);
+        }
+
+        if (!strongSelf.isWebSocketConnected || !strongSelf.isSetupHandshakeCompleted) {
+            @synchronized (strongSelf.wsPreRollPCMBuffer) {
+                [strongSelf.wsPreRollPCMBuffer appendData:pcm16Chunk];
+                if (strongSelf.wsPreRollPCMBuffer.length > 96000) {
+                    NSRange dropRange = NSMakeRange(0, strongSelf.wsPreRollPCMBuffer.length - 96000);
+                    [strongSelf.wsPreRollPCMBuffer replaceBytesInRange:dropRange withBytes:NULL length:0];
+                }
+            }
+            return;
         }
 
         // 打断检测：开启硬件 AEC 后，当 AI 正在播放且检测到清晰人声 (db > -26.0f && peakDb > -15.0f 连续 3 帧 ~65ms)
@@ -8161,7 +8325,13 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
 - (void)dismissOverlay {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.isDismissed = YES;
-        [self stopAllVoiceEngines];
+        if ((self.activeModeTab == AGConfigTabNativeLive || self.activeModeTab == AGConfigTabVideoAI) &&
+            self.isWebSocketConnected && self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
+            // 关闭界面时仅释放音频与麦克风，保持 WebSocket 在后台热备并自动续杯
+            [self suspendVoiceSessionKeepWebSocketAlive];
+        } else {
+            [self stopAllVoiceEngines];
+        }
         if (self.isVideoChatActive) {
             [self stopCameraSession];
         }
