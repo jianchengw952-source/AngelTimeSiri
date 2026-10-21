@@ -2456,9 +2456,12 @@ static void agFetchCloudModelsForTab(AGConfigTab tab, NSString *endpoint, NSStri
 @end
 
 UIKIT_EXTERN UIImage *_UICreateScreenUIImage(void);
+static void agStartAdBypassWatchdogWithContinuation(void (^completion)(BOOL skipped));
 
 static void agSafeLaunchURL(NSURL *url) {
     if (!url) return;
+    // 启动 L2 开屏广告秒跳看门狗，若有 5 秒广告则在 0.2 秒内自动跳过
+    agStartAdBypassWatchdogWithContinuation(nil);
     // 延迟 0.12s 待悬浮窗隐藏并释放 KeyWindow 后，在后台高优线程发起 LaunchServices 唤醒，彻底杜绝 SpringBoard 主线程 10 秒 XPC 死锁！
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
         @try {
@@ -2971,6 +2974,82 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
     }
 }
 
+// ==================== L2 级：开屏广告秒跳看门狗 (Vision 神经 OCR + 硬件级秒触控) ====================
+static void agStartAdBypassWatchdogWithContinuation(void (^completion)(BOOL skipped)) {
+    __block NSInteger checksRemaining = 16; // 16 次 * 0.22s = 最多监视 ~3.5 秒
+    __block BOOL didFindAd = NO;
+
+    void (^__block checkPass)(void) = ^{
+        if (didFindAd || checksRemaining <= 0) {
+            if (completion) completion(didFindAd);
+            return;
+        }
+        checksRemaining--;
+
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+            UIImage *screenImg = _UICreateScreenUIImage();
+            if (!screenImg || !screenImg.CGImage) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    checkPass();
+                });
+                return;
+            }
+
+            CGImageRef cgImg = screenImg.CGImage;
+            CGImageRetain(cgImg);
+            CGRect sb = [UIScreen mainScreen].bounds;
+
+            VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
+                CGPoint skipTapPoint = CGPointZero;
+                BOOL found = NO;
+
+                for (VNRecognizedTextObservation *obs in request.results) {
+                    CGRect box = obs.boundingBox;
+                    // 开屏广告跳过按钮通常在屏幕顶部 40% 区域（Vision 坐标系 Y: 0.60 ~ 1.0）
+                    if (box.origin.y + box.size.height >= 0.60) {
+                        VNRecognizedText *top = [[obs topCandidates:1] firstObject];
+                        if (top) {
+                            NSString *str = [[top.string stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                            if ([str containsString:@"跳过"] || [str containsString:@"skip"] || [str isEqualToString:@"x"] || [str isEqualToString:@"×"] || [str containsString:@"关闭"]) {
+                                CGFloat tapX = CGRectGetMidX(box) * sb.size.width;
+                                CGFloat tapY = (1.0 - CGRectGetMidY(box)) * sb.size.height;
+                                skipTapPoint = CGPointMake(tapX, tapY);
+                                found = YES;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                CGImageRelease(cgImg);
+
+                if (found) {
+                    didFindAd = YES;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        agLiveDiagLog(@"AD_WATCHDOG", @"Detected ad skip button, tapping at (%.1f, %.1f)", skipTapPoint.x, skipTapPoint.y);
+                        agSimulateScreenTapAtPoint(skipTapPoint);
+                        [[AGGlobalActionPillWindow sharedPill] showActionPill:@"⚡ 已为您自动秒跳开屏广告"];
+                        if (completion) completion(YES);
+                    });
+                } else {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        checkPass();
+                    });
+                }
+            }];
+            req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+            req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImg options:@{}];
+            [handler performRequests:@[req] error:nil];
+        });
+    };
+
+    // 延迟 0.35s 等待目标 App 渲染首帧后开始轮询
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        checkPass();
+    });
+}
+
 // ==================== 2. 核心控制器 (天使守护 v5.8.0 Aurora Edition) ====================
 @interface GeminiAssistantManager : NSObject <AVSpeechSynthesizerDelegate, AVAudioRecorderDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, UITextFieldDelegate, UITableViewDelegate, UITableViewDataSource, NSURLSessionDataDelegate, NSURLSessionWebSocketDelegate>
 @property (nonatomic, strong) GeminiPassthroughWindow *overlayWindow;
@@ -3162,6 +3241,8 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, strong) AVAudioPlayer *wakeupChimePlayer;        // 独立低延迟启动提示音播放器
 @property (nonatomic, assign) NSTimeInterval lastChimePlayTimestamp;   // 防重复触发时间戳
 - (void)playCrystalWakeupChimeIfNeeded;
+- (void)handleSearchOnPlatform:(NSString *)platform keyword:(NSString *)keyword;
+- (void)performVisualSearchForKeyword:(NSString *)keyword appName:(NSString *)appName;
 - (void)suspendVoiceSessionKeepWebSocketAlive;
 - (void)prewarmWebSocketInBackgroundIfNeeded;
 - (void)flushPreRollPCMBufferIfNeeded;
@@ -3766,6 +3847,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
     if (!self.overlayWindow) return;
     self.pendingWakeupChime = YES;
+    agLiveDiagLog(@"CHIME_DIAG", @"playIOS27SiriInvocationEffectFromPowerButton triggering playCrystalWakeupChimeIfNeeded");
     // 2. 立即触发 iOS 26 Siri 启动提示音（零延迟必响）
     [self playCrystalWakeupChimeIfNeeded];
 
@@ -6271,12 +6353,22 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
 // 播放 iOS 26 Siri 空灵液态琉璃双音启动提示音（D4/D5 -> A5/C#6/A6，音量 0.85f 穿透静音模式）
 - (void)playCrystalWakeupChimeIfNeeded {
-    if (!self.pendingWakeupChime) return;
-    if (self.isDismissed || !self.overlayWindow || self.overlayWindow.hidden) return;
-    if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
+    if (!self.pendingWakeupChime) {
+        agLiveDiagLog(@"CHIME_DIAG", @"playCrystalWakeupChimeIfNeeded skipped: pendingWakeupChime is NO");
+        return;
+    }
+    if (self.isDismissed || !self.overlayWindow || self.overlayWindow.hidden) {
+        agLiveDiagLog(@"CHIME_DIAG", @"playCrystalWakeupChimeIfNeeded skipped: dismissed=%d, noWindow=%d, windowHidden=%d", self.isDismissed, (self.overlayWindow == nil), self.overlayWindow.hidden);
+        return;
+    }
+    if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) {
+        agLiveDiagLog(@"CHIME_DIAG", @"playCrystalWakeupChimeIfNeeded deferred: engineReady=%d, playerReady=%d, formatReady=%d", (self.liveAudioEngine != nil), (self.pcmPlayerNode != nil), (self.playerOutputFormat != nil));
+        return;
+    }
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - self.lastChimePlayTimestamp < 0.60) {
+        agLiveDiagLog(@"CHIME_DIAG", @"playCrystalWakeupChimeIfNeeded throttled: interval=%.3fs < 0.60s", now - self.lastChimePlayTimestamp);
         self.pendingWakeupChime = NO;
         return;
     }
@@ -6284,7 +6376,10 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     self.lastChimePlayTimestamp = now;
 
     dispatch_async(self.audioPlayQueue, ^{
-        if (self.isDismissed || !self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
+        if (self.isDismissed || !self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) {
+            agLiveDiagLog(@"CHIME_DIAG", @"playCrystalWakeupChimeIfNeeded async abort: dismissed or engine invalidated");
+            return;
+        }
 
         double sampleRate = self.playerOutputFormat.sampleRate > 0 ? self.playerOutputFormat.sampleRate : 48000.0;
         AVAudioChannelCount channels = MAX(1, self.playerOutputFormat.channelCount);
@@ -6322,7 +6417,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         if (!self.liveAudioEngine.isRunning) [self.liveAudioEngine startAndReturnError:nil];
         if (!self.pcmPlayerNode.isPlaying) [self.pcmPlayerNode play];
         self.pcmPlayerNode.volume = 1.0f;
-        [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:nil];
+        [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:^{
+            agLiveDiagLog(@"CHIME_DIAG", @"Crystal wakeup chime finished playing on hardware");
+        }];
         agLiveDiagLog(@"CHIME_PLAYED", @"Played iOS 26 Siri invocation chime on pcmPlayerNode");
     });
 }
@@ -6337,6 +6434,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 if (!self.pcmPlayerNode.isPlaying) {
                     [self.pcmPlayerNode play];
                 }
+                agLiveDiagLog(@"CHIME_DIAG", @"setupAndStartFullDuplexPCMAudioEngine (reuse) triggering playCrystalWakeupChimeIfNeeded");
                 [self playCrystalWakeupChimeIfNeeded]; // ✅ 复用就绪时立刻播放水晶音
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Reusing active FullDuplex Engine (rate=%.0f)", self.playerOutputFormat.sampleRate);
                 return;
@@ -6407,6 +6505,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 self.playerOutputFormat = mixerFormat;
                 // ✅ 避开硬件爬坡静音期 (380ms 错峰，避开 VoiceProcessingIO 300~350ms 硬件静音窗)
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    agLiveDiagLog(@"CHIME_DIAG", @"setupAndStartFullDuplexPCMAudioEngine (delayed 0.38s) triggering playCrystalWakeupChimeIfNeeded");
                     [self playCrystalWakeupChimeIfNeeded];
                 });
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Started FullDuplex Engine (inRate=%.0f, outRate=%.0f, vpErr=%@)", tapFormat.sampleRate, mixerFormat.sampleRate, vpErr.localizedDescription ?: @"none");
@@ -6903,7 +7002,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         timerRe = [NSRegularExpression regularExpressionWithPattern:@"(?:定个|设个|设置|开启|来个)?(\\d{1,3})(?:分钟|分|秒)(?:的)?(?:倒计时|计时器)" options:0 error:nil];
         alarmRe = [NSRegularExpression regularExpressionWithPattern:@"(?:定个|设个|设置|定一个)?(?:明天|明早|早上|上午|下午|晚上)?(\\d{1,2})(?:点|时|:|：)(?:(\\d{1,2})分?)?(?:的)?闹钟" options:0 error:nil];
         tapTextRe = [NSRegularExpression regularExpressionWithPattern:@"(?:点击|点一下)(?:屏幕上的|按钮)?[“\"'「]?([^”\"'」，。！？,.!?\\s]+)[”\"'」]?" options:0 error:nil];
-        searchRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:打开|启动|在|去|用|上)?(淘宝|京东|拼多多|美团|抖音|b站|哔哩哔哩|小红书|知乎|微博|百度)(?:里|上|app)?(?:帮我)?(?:搜一下|搜索一下|查找一下|找一下|搜索|搜|找|买|看)(?:一下)?(.+)$" options:0 error:nil];
+        searchRegex = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:打开|启动|在|去|用|上)?([^，。！？,.!?\\s”"'\\d]{1,10}?)(?:里|上|app|软件|客户端)?)?(?:搜一下|搜索一下|查找一下|找一下|搜索|搜|找|买|看)(?:一下|个|点|部|台|件|张|本)?(.+)$" options:0 error:nil];
         naviRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:打开|用|使用)?(?:高德地图|百度地图|苹果地图|高德|百度|地图)?(?:帮我)?(?:导航|驾车|骑行|步行)?(?:到|去|前往|去往)(.+?)(?:怎么走|怎么去|吧|呢)?$" options:0 error:nil];
         musicRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:在网易云|在qq音乐|听|播放)(?:搜|播|听)?([^，。！？,.!?\\s]+)" options:0 error:nil];
         openRegex = [NSRegularExpression regularExpressionWithPattern:@"^(?:打开|启动|开启)([^，。！？,.!?\\s”\"']+)$" options:0 error:nil];
@@ -7194,10 +7293,14 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         return YES;
     }
 
-    // 🛍️/🎬 各大电商与视频平台搜索（支持“打开淘宝搜索一下手机”、“去京东搜充电宝”、“在拼多多找纸巾”等全套口语）
+    // 🛍️/🎬 三级混合智能体搜索（支持全国所有主流电商、视频、生活、地图与本地应用搜索，带“淘宝搜索手机”、“京东买充电宝”、“小红书搜穿搭”等全套口语）
     NSTextCheckingResult *searchMatch = [searchRegex firstMatchInString:cleanCmd options:0 range:NSMakeRange(0, cleanCmd.length)];
     if (searchMatch && searchMatch.numberOfRanges >= 3) {
-        NSString *pltName = [cleanCmd substringWithRange:[searchMatch rangeAtIndex:1]];
+        NSString *pltName = @"baidu";
+        if ([searchMatch rangeAtIndex:1].location != NSNotFound) {
+            NSString *p = [cleanCmd substringWithRange:[searchMatch rangeAtIndex:1]];
+            if (p.length > 0) pltName = p;
+        }
         NSString *kw = [[cleanCmd substringWithRange:[searchMatch rangeAtIndex:2]] stringByTrimmingCharactersInSet:[NSCharacterSet punctuationCharacterSet]];
         kw = [kw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (kw.length > 0) {
@@ -7423,6 +7526,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         self.previousKeyWindow = nil;
         [[AGGlobalActionPillWindow sharedPill] showActionPill:[NSString stringWithFormat:@"🚀 正在打开 %@...", appName]];
         [self dismissOverlay];
+        // 启动 L2 开屏广告秒跳看门狗
+        agStartAdBypassWatchdogWithContinuation(nil);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
             @try {
                 [[%c(LSApplicationWorkspace) defaultWorkspace] openApplicationWithBundleID:targetBundleID];
@@ -7990,39 +8095,264 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     }
 }
 
+// ==================== L3 级：端侧视觉搜索智能体 (GUI Agent 视觉定位+键盘自动打字上屏) ====================
+- (void)performVisualSearchForKeyword:(NSString *)keyword appName:(NSString *)appName {
+    if (!keyword || keyword.length == 0) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.80 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIImage *screenImg = _UICreateScreenUIImage();
+        if (!screenImg || !screenImg.CGImage) return;
+        CGImageRef cgImg = screenImg.CGImage;
+        CGImageRetain(cgImg);
+        CGRect sb = [UIScreen mainScreen].bounds;
+
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+            VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
+                CGPoint searchTapPoint = CGPointZero;
+                BOOL found = NO;
+
+                // 优先在屏幕上半部分 (Y: 0.50 ~ 0.98) 寻找搜索栏标识文字
+                for (VNRecognizedTextObservation *obs in request.results) {
+                    CGRect box = obs.boundingBox;
+                    if (box.origin.y + box.size.height >= 0.50) {
+                        VNRecognizedText *top = [[obs topCandidates:1] firstObject];
+                        if (top) {
+                            NSString *str = [[top.string stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                            if ([str containsString:@"搜索"] || [str containsString:@"搜一搜"] || [str containsString:@"大家都在搜"] || [str containsString:@"找"] || [str containsString:@"商品"] || [str containsString:@"输入"]) {
+                                CGFloat tapX = CGRectGetMidX(box) * sb.size.width;
+                                CGFloat tapY = (1.0 - CGRectGetMidY(box)) * sb.size.height;
+                                searchTapPoint = CGPointMake(tapX, tapY);
+                                found = YES;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                CGImageRelease(cgImg);
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    CGPoint finalTapPoint = found ? searchTapPoint : CGPointMake(sb.size.width * 0.5f, 95.0f); // 默认顶部导航栏搜索条中心位置
+                    agLiveDiagLog(@"VISUAL_AGENT", @"Visual search tapped at (%.1f, %.1f), foundCandidate=%d", finalTapPoint.x, finalTapPoint.y, found);
+                    agSimulateScreenTapAtPoint(finalTapPoint);
+
+                    // 延迟 0.35s 等待输入焦点激活，自动粘贴/上屏并执行搜索
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [UIPasteboard generalPasteboard].string = keyword;
+                        Class kbCls = objc_getClass("UIKeyboardImpl");
+                        id kb = (kbCls && [kbCls respondsToSelector:@selector(activeInstance)]) ? [kbCls activeInstance] : nil;
+                        if (kb && [kb respondsToSelector:@selector(insertText:)]) {
+                            [kb insertText:keyword];
+                        }
+                        [[AGGlobalActionPillWindow sharedPill] showActionPill:[NSString stringWithFormat:@"🔍 已在 %@ 填入「%@」", appName ?: @"应用", keyword]];
+
+                        // 延迟 0.25s 触发回车搜索
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            if (kb && [kb respondsToSelector:@selector(handleKeyWithString:)]) {
+                                [kb handleKeyWithString:@"\n"];
+                            }
+                        });
+                    });
+                });
+            }];
+            req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+            req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImg options:@{}];
+            [handler performRequests:@[req] error:nil];
+        });
+    });
+}
+
 - (void)handleSearchOnPlatform:(NSString *)platform keyword:(NSString *)keyword {
     if (!keyword || keyword.length == 0) return;
-    NSString *encoded = [keyword stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-    NSString *plt = [platform lowercaseString];
+    NSString *cleanKw = [keyword stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *encoded = [cleanKw stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    NSString *plt = [[platform stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
     NSURL *targetURL = nil;
-    NSString *pillText = [NSString stringWithFormat:@"🔍 正在检索: %@...", keyword];
+    NSString *pillText = [NSString stringWithFormat:@"🔍 正在检索: %@...", cleanKw];
 
+    // ==================== L1 级：中国主流应用 DeepLink 协议矩阵直达 ====================
     if ([plt containsString:@"taobao"] || [plt containsString:@"淘宝"]) {
-        pillText = [NSString stringWithFormat:@"🛍️ 正在淘宝搜索: %@...", keyword];
+        pillText = [NSString stringWithFormat:@"🛍️ 正在淘宝搜索: %@...", cleanKw];
         targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"taobao://s.taobao.com/search?q=%@", encoded]];
     } else if ([plt containsString:@"jd"] || [plt containsString:@"京东"]) {
-        pillText = [NSString stringWithFormat:@"📦 正在京东搜索: %@...", keyword];
-        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"openapp.jdmobile://virtual?params={\"category\":\"jump\",\"des\":\"productList\",\"keyWord\":\"%@\"}", encoded]];
-    } else if ([plt containsString:@"meituan"] || [plt containsString:@"美团"] || [plt containsString:@"外卖"]) {
-        pillText = [NSString stringWithFormat:@"🍔 正在美团搜索: %@...", keyword];
-        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"imeituan://www.meituan.com/search?keyword=%@", encoded]];
-    } else if ([plt containsString:@"douyin"] || [plt containsString:@"抖音"]) {
-        pillText = [NSString stringWithFormat:@"🎵 正在抖音搜索: %@...", keyword];
-        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"snssdk1128://search?keyword=%@", encoded]];
-    } else if ([plt containsString:@"bilibili"] || [plt containsString:@"b站"] || [plt containsString:@"哔哩哔哩"]) {
-        pillText = [NSString stringWithFormat:@"📺 正在B站搜索: %@...", keyword];
-        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"bilibili://search?keyword=%@", encoded]];
+        pillText = [NSString stringWithFormat:@"📦 正在京东搜索: %@...", cleanKw];
+        // 关键修复：京东 openapp.jdmobile 要求对 JSON 参数做完全 URL 编码，避免非法字符导致 [NSURL URLWithString:] 返回 nil
+        NSString *jdJson = [NSString stringWithFormat:@"{\"category\":\"jump\",\"des\":\"productList\",\"keyWord\":\"%@\"}", cleanKw];
+        NSString *encodedParams = [jdJson stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet alphanumericCharacterSet]];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"openapp.jdmobile://virtual?params=%@", encodedParams]];
     } else if ([plt containsString:@"pdd"] || [plt containsString:@"拼多多"]) {
-        pillText = [NSString stringWithFormat:@"🛍️ 正在拼多多搜索: %@...", keyword];
+        pillText = [NSString stringWithFormat:@"🛍️ 正在拼多多搜索: %@...", cleanKw];
         targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"pinduoduo://com.xunmeng.pinduoduo/search_result.html?search_key=%@", encoded]];
+    } else if ([plt containsString:@"xianyu"] || [plt containsString:@"闲鱼"]) {
+        pillText = [NSString stringWithFormat:@"🐟 正在闲鱼搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"fleamarket://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"dewu"] || [plt containsString:@"得物"] || [plt containsString:@"毒"]) {
+        pillText = [NSString stringWithFormat:@"👟 正在得物搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"duapp://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"zhuanzhuan"] || [plt containsString:@"转转"]) {
+        pillText = [NSString stringWithFormat:@"🔄 正在转转搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"zhuanzhuan://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"vip"] || [plt containsString:@"唯品会"]) {
+        pillText = [NSString stringWithFormat:@"👗 正在唯品会搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"vipshop://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"meituan"] || [plt containsString:@"美团"] || [plt containsString:@"外卖"]) {
+        pillText = [NSString stringWithFormat:@"🍔 正在美团搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"imeituan://www.meituan.com/search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"eleme"] || [plt containsString:@"饿了么"]) {
+        pillText = [NSString stringWithFormat:@"🍱 正在饿了么搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"eleme://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"dianping"] || [plt containsString:@"大众点评"] || [plt containsString:@"点评"]) {
+        pillText = [NSString stringWithFormat:@"⭐ 正在大众点评搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"dianping://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"hema"] || [plt containsString:@"盒马"]) {
+        pillText = [NSString stringWithFormat:@"🦛 正在盒马搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"freshsearch://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"douyin"] || [plt containsString:@"抖音"]) {
+        pillText = [NSString stringWithFormat:@"🎵 正在抖音搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"snssdk1128://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"kuaishou"] || [plt containsString:@"快手"]) {
+        pillText = [NSString stringWithFormat:@"⚡ 正在快手搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"kwai://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"bilibili"] || [plt containsString:@"b站"] || [plt containsString:@"哔哩哔哩"]) {
+        pillText = [NSString stringWithFormat:@"📺 正在B站搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"bilibili://search?keyword=%@", encoded]];
     } else if ([plt containsString:@"xiaohongshu"] || [plt containsString:@"xhs"] || [plt containsString:@"小红书"]) {
-        pillText = [NSString stringWithFormat:@"📕 正在小红书搜索: %@...", keyword];
+        pillText = [NSString stringWithFormat:@"📕 正在小红书搜索: %@...", cleanKw];
         targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"xhsdiscover://search/result?keyword=%@", encoded]];
-    } else {
-        pillText = [NSString stringWithFormat:@"🔍 正在百度搜索: %@...", keyword];
-        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://www.baidu.com/s?wd=%@", encoded]];
+    } else if ([plt containsString:@"weibo"] || [plt containsString:@"微博"]) {
+        pillText = [NSString stringWithFormat:@"📢 正在微博搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"sinaweibo://searchall?q=%@", encoded]];
+    } else if ([plt containsString:@"zhihu"] || [plt containsString:@"知乎"]) {
+        pillText = [NSString stringWithFormat:@"💡 正在知乎搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"zhihu://search?q=%@", encoded]];
+    } else if ([plt containsString:@"toutiao"] || [plt containsString:@"今日头条"] || [plt containsString:@"头条"]) {
+        pillText = [NSString stringWithFormat:@"📰 正在今日头条搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"snssdk141://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"tieba"] || [plt containsString:@"贴吧"] || [plt containsString:@"百度贴吧"]) {
+        pillText = [NSString stringWithFormat:@"💬 正在贴吧搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"com.baidu.tieba://search?word=%@", encoded]];
+    } else if ([plt containsString:@"douban"] || [plt containsString:@"豆瓣"]) {
+        pillText = [NSString stringWithFormat:@"🎬 正在豆瓣搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"douban://douban.com/search?q=%@", encoded]];
+    } else if ([plt containsString:@"tencent"] || [plt containsString:@"qq视频"] || [plt containsString:@"腾讯视频"]) {
+        pillText = [NSString stringWithFormat:@"🐧 正在腾讯视频搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"tenvideo://search?k=%@", encoded]];
+    } else if ([plt containsString:@"iqiyi"] || [plt containsString:@"爱奇艺"]) {
+        pillText = [NSString stringWithFormat:@"🥝 正在爱奇艺搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"iqiyi://search/result?key=%@", encoded]];
+    } else if ([plt containsString:@"youku"] || [plt containsString:@"优酷"]) {
+        pillText = [NSString stringWithFormat:@"▶️ 正在优酷搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"youku://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"xigua"] || [plt containsString:@"西瓜视频"]) {
+        pillText = [NSString stringWithFormat:@"🍉 正在西瓜视频搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"snssdk32://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"mgtv"] || [plt containsString:@"芒果"] || [plt containsString:@"芒果tv"]) {
+        pillText = [NSString stringWithFormat:@"🥭 正在芒果TV搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"imgotv://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"netease"] || [plt containsString:@"网易云"] || [plt containsString:@"云音乐"]) {
+        pillText = [NSString stringWithFormat:@"🎵 正在网易云音乐搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"orpheus://song/search/%@", encoded]];
+    } else if ([plt containsString:@"qqmusic"] || [plt containsString:@"qq音乐"]) {
+        pillText = [NSString stringWithFormat:@"🎶 正在QQ音乐搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"qqmusic://qq.com/ui/search?key=%@", encoded]];
+    } else if ([plt containsString:@"kugou"] || [plt containsString:@"酷狗"]) {
+        pillText = [NSString stringWithFormat:@"🐕 正在酷狗音乐搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"kugouURL://?search=%@", encoded]];
+    } else if ([plt containsString:@"ximalaya"] || [plt containsString:@"喜马拉雅"]) {
+        pillText = [NSString stringWithFormat:@"📻 正在喜马拉雅搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"iting://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"amap"] || [plt containsString:@"高德"]) {
+        pillText = [NSString stringWithFormat:@"🧭 正在高德地图搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"iosamap://poi?sourceApplication=TimeGuardian&name=%@", encoded]];
+    } else if ([plt containsString:@"baidumap"] || [plt containsString:@"百度地图"]) {
+        pillText = [NSString stringWithFormat:@"🗺️ 正在百度地图搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"baidumap://map/place/search?query=%@", encoded]];
+    } else if ([plt containsString:@"autohome"] || [plt containsString:@"汽车之家"]) {
+        pillText = [NSString stringWithFormat:@"🚗 正在汽车之家搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"autohome://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"dongchedi"] || [plt containsString:@"懂车帝"]) {
+        pillText = [NSString stringWithFormat:@"🏎️ 正在懂车帝搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"snssdk1530://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"ctrip"] || [plt containsString:@"携程"]) {
+        pillText = [NSString stringWithFormat:@"✈️ 正在携程搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"ctrip://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"qunar"] || [plt containsString:@"去哪儿"]) {
+        pillText = [NSString stringWithFormat:@"🛫 正在去哪儿搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"qunariphone://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"fliggy"] || [plt containsString:@"飞猪"]) {
+        pillText = [NSString stringWithFormat:@"🐷 正在飞猪搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"alitrip://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"weread"] || [plt containsString:@"微信读书"]) {
+        pillText = [NSString stringWithFormat:@"📖 正在微信读书搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"weread://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"boss"] || [plt containsString:@"boss直聘"]) {
+        pillText = [NSString stringWithFormat:@"💼 正在BOSS直聘搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"bosszhipin://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"xueqiu"] || [plt containsString:@"雪球"]) {
+        pillText = [NSString stringWithFormat:@"📈 正在雪球搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"xueqiu://search?keyword=%@", encoded]];
+    } else if ([plt containsString:@"alipay"] || [plt containsString:@"支付宝"]) {
+        pillText = [NSString stringWithFormat:@"🔵 正在支付宝搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"alipays://platformapi/startapp?appId=20001003&keyword=%@", encoded]];
+    } else if ([plt containsString:@"quark"] || [plt containsString:@"夸克"]) {
+        pillText = [NSString stringWithFormat:@"🔬 正在夸克搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"quark://search?q=%@", encoded]];
+    } else if ([plt containsString:@"baidu"] || [plt containsString:@"百度"]) {
+        pillText = [NSString stringWithFormat:@"🔍 正在百度搜索: %@...", cleanKw];
+        targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"baiduboxapp://v1/easybrowse/search?word=%@", encoded]];
     }
 
+    if (targetURL) {
+        [[AGGlobalActionPillWindow sharedPill] showActionPill:pillText];
+        [self dismissOverlay];
+        agSafeLaunchURL(targetURL);
+        return;
+    }
+
+    // ==================== L3 级：端侧视觉智能体 (对无 DeepLink 或本地安装的任意第三方应用进行视觉定位+自动打字搜索) ====================
+    NSString *cleanPlt = plt;
+    NSString *bundleID = self.builtinAppMap[cleanPlt];
+    if (!bundleID && self.cachedInstalledApps.count > 0) {
+        bundleID = self.cachedInstalledApps[cleanPlt];
+        if (!bundleID) {
+            for (NSString *loc in self.cachedInstalledApps) {
+                if ([loc containsString:cleanPlt] || [cleanPlt containsString:loc]) {
+                    bundleID = self.cachedInstalledApps[loc];
+                    break;
+                }
+            }
+        }
+    }
+    if (!bundleID) {
+        NSArray<LSApplicationProxy *> *apps = [[%c(LSApplicationWorkspace) defaultWorkspace] allInstalledApplications];
+        for (LSApplicationProxy *proxy in apps) {
+            NSString *locName = [proxy.localizedName lowercaseString];
+            if (locName && ([locName containsString:cleanPlt] || [cleanPlt containsString:locName])) {
+                bundleID = proxy.applicationIdentifier;
+                self.cachedInstalledApps[locName] = bundleID;
+                break;
+            }
+        }
+    }
+
+    if (bundleID) {
+        [[AGGlobalActionPillWindow sharedPill] showActionPill:[NSString stringWithFormat:@"🚀 正在打开%@并视觉搜索: %@...", platform, cleanKw]];
+        [self dismissOverlay];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+            @try {
+                [[%c(LSApplicationWorkspace) defaultWorkspace] openApplicationWithBundleID:bundleID];
+            } @catch (NSException *e) {}
+        });
+        // 启动 L2 广告看门狗，跳过后执行 L3 视觉搜索
+        agStartAdBypassWatchdogWithContinuation:^(BOOL skipped) {
+            [self performVisualSearchForKeyword:cleanKw appName:platform];
+        };
+        return;
+    }
+
+    // 默认回退至网页百度
+    pillText = [NSString stringWithFormat:@"🔍 正在百度搜索: %@...", cleanKw];
+    targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://www.baidu.com/s?wd=%@", encoded]];
     [[AGGlobalActionPillWindow sharedPill] showActionPill:pillText];
     [self dismissOverlay];
     agSafeLaunchURL(targetURL);
@@ -8487,9 +8817,16 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
 - (void)triggerFromSystemHook {
     agWakeScreenBacklightIfNeeded();
-    self.pendingWakeupChime = YES;
+    BOOL willOpen = (self.overlayWindow == nil || self.overlayWindow.hidden || self.overlayWindow.alpha <= 0.1);
+    if (willOpen) {
+        self.pendingWakeupChime = YES;
+    }
+    agLiveDiagLog(@"CHIME_DIAG", @"triggerFromSystemHook called: willOpen=%d, pendingChime=%d", willOpen, self.pendingWakeupChime);
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - self.lastTriggerTime < 0.45) return;
+    if (now - self.lastTriggerTime < 0.45) {
+        agLiveDiagLog(@"CHIME_DIAG", @"triggerFromSystemHook throttled: dt=%.3f < 0.45", now - self.lastTriggerTime);
+        return;
+    }
     self.lastTriggerTime = now;
 
     pauseBackgroundMediaPlayback();
