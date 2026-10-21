@@ -3104,6 +3104,9 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, strong) NSTimer *wsKeepAlivePingTimer;
 @property (nonatomic, assign) NSTimeInterval lastDismissTimestamp;
 @property (nonatomic, assign) BOOL isWarmStandbyMode;
+@property (nonatomic, assign) BOOL pendingWakeupChime;
+@property (nonatomic, assign) NSTimeInterval chimeMuteUntilTimestamp;
+- (void)playCrystalWakeupChimeIfNeeded;
 - (void)suspendVoiceSessionKeepWebSocketAlive;
 - (void)prewarmWebSocketInBackgroundIfNeeded;
 - (void)flushPreRollPCMBufferIfNeeded;
@@ -3677,6 +3680,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
 - (void)playIOS27SiriInvocationEffectFromPowerButton:(BOOL)fromPowerButton {
     if (!self.overlayWindow) return;
+    self.pendingWakeupChime = YES;
     CGRect sb = [UIScreen mainScreen].bounds;
 
     // 1. 双阶物理震动反馈 (复刻 iOS 27 港版唤醒手感)
@@ -6096,6 +6100,70 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     });
 }
 
+// 合成并播放 220ms 空灵清脆水晶双音和弦 (D5 -> A5 泛音叠置)，代表麦克风已 100% 就绪
+- (void)playCrystalWakeupChimeIfNeeded {
+    if (!self.pendingWakeupChime) return;
+    if (self.isDismissed || self.isWarmStandbyMode || !self.overlayWindow || self.overlayWindow.hidden) return;
+    if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
+
+    self.pendingWakeupChime = NO;
+    // 开启 240ms 麦克风防串音保护窗，防止提示音被录进 wsPreRollPCMBuffer 发给 AI
+    self.chimeMuteUntilTimestamp = [[NSDate date] timeIntervalSince1970] + 0.24;
+
+    dispatch_async(self.audioPlayQueue, ^{
+        if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
+
+        double sampleRate = self.playerOutputFormat.sampleRate > 0 ? self.playerOutputFormat.sampleRate : 48000.0;
+        AVAudioChannelCount channels = MAX(1, self.playerOutputFormat.channelCount);
+        double duration = 0.22; // 总长 220ms，短促空灵不拖沓
+        AVAudioFrameCount totalFrames = (AVAudioFrameCount)(sampleRate * duration);
+
+        AVAudioPCMBuffer *chimeBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:self.playerOutputFormat frameCapacity:totalFrames];
+        chimeBuf.frameLength = totalFrames;
+
+        for (AVAudioFrameCount i = 0; i < totalFrames; i++) {
+            float t = (float)i / (float)sampleRate;
+            float sample = 0.0f;
+
+            // 第一声水晶音 (0.00s ~ 0.10s): D5 (587.33Hz) + 八度泛音 D6 + 五度泛音 A6
+            if (t < 0.11f) {
+                float env1 = (t < 0.004f) ? (t / 0.004f) : expf(-(t - 0.004f) * 30.0f);
+                float tone1 = sinf(2.0f * (float)M_PI * 587.33f * t) * 0.65f
+                            + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.25f
+                            + sinf(2.0f * (float)M_PI * 1760.00f * t) * 0.10f;
+                sample += tone1 * env1;
+            }
+
+            // 第二声水晶和弦 (0.065s ~ 0.22s): A5 (880.0Hz) + 大三度泛音 C#6 + 八度晶莹泛音 A6 (与第一声自然交融产生空灵余韵)
+            if (t >= 0.065f) {
+                float t2 = t - 0.065f;
+                float env2 = (t2 < 0.004f) ? (t2 / 0.004f) : expf(-(t2 - 0.004f) * 19.0f);
+                float tone2 = sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.60f
+                            + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.22f
+                            + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.18f;
+                sample += tone2 * env2;
+            }
+
+            sample *= 0.26f; // 柔和清脆音量，不刺耳、不削波
+            sample = MAX(-1.0f, MIN(1.0f, sample));
+
+            for (AVAudioChannelCount ch = 0; ch < channels; ch++) {
+                if (chimeBuf.floatChannelData[ch]) {
+                    chimeBuf.floatChannelData[ch][i] = sample;
+                }
+            }
+        }
+
+        if (!self.liveAudioEngine.isRunning) {
+            [self.liveAudioEngine startAndReturnError:nil];
+        }
+        if (!self.pcmPlayerNode.isPlaying) {
+            [self.pcmPlayerNode play];
+        }
+        [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:nil];
+    });
+}
+
 - (void)setupAndStartFullDuplexPCMAudioEngine {
     NSUInteger expectedToken = self.sessionGenerationToken;
     dispatch_async(agAudioSerialQueue(), ^{
@@ -6106,6 +6174,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 if (!self.pcmPlayerNode.isPlaying) {
                     [self.pcmPlayerNode play];
                 }
+                [self playCrystalWakeupChimeIfNeeded]; // ✅ 复用就绪时立刻播放水晶音
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Reusing active FullDuplex Engine (rate=%.0f)", self.playerOutputFormat.sampleRate);
                 return;
             }
@@ -6173,6 +6242,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 self.liveAudioEngine = engine;
                 self.pcmPlayerNode = player;
                 self.playerOutputFormat = mixerFormat;
+                [self playCrystalWakeupChimeIfNeeded]; // ✅ 硬件引擎启动成功瞬间播放水晶音
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Started FullDuplex Engine (inRate=%.0f, outRate=%.0f, vpErr=%@)", tapFormat.sampleRate, mixerFormat.sampleRate, vpErr.localizedDescription ?: @"none");
             } else {
                 agLiveDiagLog(@"AUDIO_ERR", @"AVAudioEngine start error: %@", startErr.localizedDescription);
@@ -6185,6 +6255,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
 - (void)processMicrophoneInputPCMBuffer:(AVAudioPCMBuffer *)buffer {
     if (!buffer || buffer.frameLength == 0 || buffer.floatChannelData == NULL) return;
+
+    // 播放启动水晶提示音的 240ms 内暂不采集麦克风，防止提示音本身被录进预录缓冲区发给 AI
+    if ([[NSDate date] timeIntervalSince1970] < self.chimeMuteUntilTimestamp) return;
 
     AVAudioFrameCount inFrames = buffer.frameLength;
     double inSampleRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000.0;
