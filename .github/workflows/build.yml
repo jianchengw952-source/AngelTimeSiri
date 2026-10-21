@@ -1,0 +1,29 @@
+name: Build 天使时光siri (v6.0.0)
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Theos on macOS
+        run: |
+          brew install ldid xz
+          git clone --recursive --depth=1 https://github.com/theos/theos.git $HOME/theos
+          rm -rf $HOME/theos/sdks
+          git clone --depth=1 https://github.com/theos/sdks.git $HOME/theos/sdks
+
+      - name: Build Package
+        run: |
+          export THEOS=$HOME/theos
+          chmod 0755 layout/DEBIAN/postinst || true
+          make package FINALPACKAGE=1
+
+      - name: Upload Compiled .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: AngelTimeSiri-arm64-Deb
+          path: packages/*.deb

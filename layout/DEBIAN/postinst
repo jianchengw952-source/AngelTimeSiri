@@ -1,0 +1,15 @@
+#!/bin/sh
+rm -f /var/jb/Library/PreferenceLoader/Preferences/AISiriSettings.plist 2>/dev/null || true
+rm -rf /var/jb/Library/PreferenceBundles/AISiriSettings.bundle 2>/dev/null || true
+chmod 0755 /var/jb/usr/bin/AngelCameraHelper 2>/dev/null || true
+chmod 0755 /usr/bin/AngelCameraHelper 2>/dev/null || true
+if [ -f /var/mobile/Library/TCC/TCC.db ]; then
+    sqlite3 /var/mobile/Library/TCC/TCC.db "DELETE FROM access WHERE (client='com.apple.springboard' OR client='AngelCameraHelper' OR client='/var/jb/usr/bin/AngelCameraHelper') AND (service='kTCCServiceCamera' OR service='kTCCServiceMicrophone');" 2>/dev/null || true
+    sqlite3 /var/mobile/Library/TCC/TCC.db "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceCamera','com.apple.springboard',0,2,2,1);" 2>/dev/null || true
+    sqlite3 /var/mobile/Library/TCC/TCC.db "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceMicrophone','com.apple.springboard',0,2,2,1);" 2>/dev/null || true
+    sqlite3 /var/mobile/Library/TCC/TCC.db "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceCamera','AngelCameraHelper',1,2,2,1);" 2>/dev/null || true
+    sqlite3 /var/mobile/Library/TCC/TCC.db "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceCamera','/var/jb/usr/bin/AngelCameraHelper',1,2,2,1);" 2>/dev/null || true
+    chown mobile:mobile /var/mobile/Library/TCC/TCC.db* 2>/dev/null || true
+    killall -9 tccd 2>/dev/null || /var/jb/usr/bin/killall -9 tccd 2>/dev/null || true
+fi
+exit 0

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.no-container</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.device.microphone</key>
+    <true/>
+    <key>com.apple.private.camera.access</key>
+    <true/>
+    <key>com.apple.private.camera.client</key>
+    <true/>
+    <key>com.apple.private.camera.allow-all-cameras</key>
+    <true/>
+    <key>com.apple.developer.avfoundation.multitasking-camera-access</key>
+    <true/>
+    <key>com.apple.private.avfoundation.capture.allow-background-camera-access</key>
+    <true/>
+    <key>com.apple.private.cmio.allow-background-camera-access</key>
+    <true/>
+    <key>com.apple.private.mediaserverd.allow-background-camera</key>
+    <true/>
+    <key>com.apple.private.tcc.allow</key>
+    <array>
+        <string>kTCCServiceCamera</string>
+        <string>kTCCServiceMicrophone</string>
+    </array>
+    <key>com.apple.private.tcc.allow-overridable</key>
+    <array>
+        <string>kTCCServiceCamera</string>
+        <string>kTCCServiceMicrophone</string>
+    </array>
+    <key>com.apple.private.cmc.allow-background-camera</key>
+    <true/>
+    <key>com.apple.private.cmcapture.allow-background-camera</key>
+    <true/>
+    <key>com.apple.private.avfoundation.background-camera-access</key>
+    <true/>
+    <key>com.apple.security.exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.apple.coremedia.capturesession</string>
+        <string>com.apple.coremedia.capturesource</string>
+        <string>com.apple.camera.cameracaptured</string>
+    </array>
+    <key>com.apple.springboard.debugapplications</key>
+    <true/>
+</dict>
+</plist>

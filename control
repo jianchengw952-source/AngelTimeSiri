@@ -1,0 +1,11 @@
+Package: com.custom.timeguardian
+Name: 时光守护
+Version: 6.0.0
+Architecture: iphoneos-arm64
+Description: 时光守护 (TimeGuardian) - 微信跨进程自动发消息 + 全系系统级自动化与快捷操作执行 + 灵动微胶囊反馈 + 官方级双向对讲视讯与覆膜翻译
+Maintainer: Custom
+Author: Custom
+Section: Tweaks
+Depends: mobilesubstrate | org.coolstar.libhooker | ellekit
+Replaces: com.custom.geminisirioverlay, com.custom.aisiri
+Conflicts: com.custom.geminisirioverlay, com.custom.aisiri
