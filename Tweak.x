@@ -414,6 +414,9 @@ static void agWakeScreenBacklightIfNeeded(void) {
 - (void)dismissSiriViewController:(id)arg1 withReason:(NSUInteger)reason;
 @end
 
+@interface SBAssistantWindow : UIWindow
+@end
+
 @interface SBBrightnessController : NSObject
 + (instancetype)sharedBrightnessController;
 - (void)setBrightnessLevel:(float)level;
@@ -3187,9 +3190,11 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
 }
 
 static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // 当屏幕点亮且未处于锁屏黑屏态时，后台静默预连 WebSocket
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         GeminiAssistantManager *mgr = [GeminiAssistantManager sharedManager];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        // 关键防护：若用户刚刚呼出过主界面（4秒内）或主界面未关闭，严禁后台预热介入干扰当前麦克风会话！
+        if (!mgr.isDismissed || (now - mgr.lastTriggerTime < 4.0)) return;
         if ([mgr isTweakEnabled] && (!mgr.overlayWindow || mgr.overlayWindow.hidden)) {
             [mgr prewarmWebSocketInBackgroundIfNeeded];
         }
@@ -5353,34 +5358,67 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 #pragma mark - 🎙️ 双核自适应语音对讲调度器
 
 - (void)forceKillNativeSiri {
-    void (^dismissBlock)(void) = ^{
-        SBAssistantController *ac = [%c(SBAssistantController) sharedInstance];
-        if (ac) {
-            if ([ac respondsToSelector:@selector(dismissAssistantViewIfNecessaryWithAnimation:)]) {
-                [ac dismissAssistantViewIfNecessaryWithAnimation:0];
-            } else if ([ac respondsToSelector:@selector(dismissAssistantViewIfNecessary)]) {
-                [ac dismissAssistantViewIfNecessary];
+    void (^killSiriPass)(void) = ^{
+        @try {
+            SBAssistantController *ac = [%c(SBAssistantController) sharedInstance];
+            if (ac) {
+                if ([ac respondsToSelector:@selector(dismissAssistantViewIfNecessaryWithAnimation:)]) {
+                    [ac dismissAssistantViewIfNecessaryWithAnimation:0];
+                } else if ([ac respondsToSelector:@selector(dismissAssistantViewIfNecessary)]) {
+                    [ac dismissAssistantViewIfNecessary];
+                }
             }
-        }
+            // 遍历所有 WindowScene，彻底隐藏并关闭锁屏/桌面下的 SBAssistantWindow 与 SiriPresentation 控制器
+            if (@available(iOS 13.0, *)) {
+                for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                    if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                    UIWindowScene *ws = (UIWindowScene *)scene;
+                    for (UIWindow *win in ws.windows) {
+                        if (win == self.overlayWindow) continue;
+                        NSString *winCls = NSStringFromClass([win class]);
+                        NSString *vcCls = win.rootViewController ? NSStringFromClass([win.rootViewController class]) : @"";
+                        if ([winCls containsString:@"Assistant"] || [winCls containsString:@"Siri"] ||
+                            [vcCls containsString:@"SiriPresentation"] || [vcCls containsString:@"Assistant"]) {
+                            UIViewController *rvc = win.rootViewController;
+                            if ([rvc respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
+                                [(SiriPresentationSpringBoardMainScreenViewController *)rvc dismissSiriViewController:rvc withReason:1];
+                            } else if ([rvc respondsToSelector:@selector(dismissSiriViewController:)]) {
+                                [(SiriPresentationSpringBoardMainScreenViewController *)rvc dismissSiriViewController:rvc];
+                            }
+                            win.alpha = 0.0;
+                            win.hidden = YES;
+                        }
+                    }
+                }
+            }
+        } @catch (NSException *e) {}
     };
+
     if ([NSThread isMainThread]) {
-        dismissBlock();
+        killSiriPass();
     } else {
-        dispatch_async(dispatch_get_main_queue(), dismissBlock);
+        dispatch_async(dispatch_get_main_queue(), killSiriPass);
     }
-    killNativeSiriAudioDaemon();
+    // 锁屏下“嘿 Siri”的 SiriPresentation 会异步延迟 80~220ms 挂载，连续 3 次压制确保其绝对无法弹出或抢走麦克风
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), killSiriPass);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), killSiriPass);
 }
 
 // 亮屏/后台静默预连：只建立 WebSocket 与 setup 握手，绝不启动 AVAudioEngine，不影响音量与嘿 Siri
 - (void)prewarmWebSocketInBackgroundIfNeeded {
     if (![self isTweakEnabled]) return;
-    // ✅ 修复：如果当前悬浮窗已经弹出显示，严禁触发后台预热覆写 isWarmStandbyMode！
-    if (!self.isDismissed && self.overlayWindow && !self.overlayWindow.hidden && self.overlayWindow.alpha > 0.05) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // ✅ 核心修复：只要当前不是已关闭状态 (isDismissed == NO)，或者距离用户唤醒不足 4 秒，绝对禁止触发后台预热！
+    // 彻底杜绝唤醒瞬间 UIApplicationDidBecomeActiveNotification 触发预热把 isWarmStandbyMode 改回 YES 导致麦克风被杀！
+    if (!self.isDismissed || (now - self.lastTriggerTime < 4.0)) {
+        return;
+    }
+    if (self.overlayWindow && !self.overlayWindow.hidden) {
         return;
     }
     if (self.activeModeTab == AGConfigTabPureText || self.activeModeTab == AGConfigTabTranslation) return;
-    if (self.isWebSocketConnected && self.isSetupHandshakeCompleted && self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
-        return; // 已在线且完成握手，无需重复连接
+    if (self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
+        return; // 已在连接或已在线，绝不重复重建
     }
     NSString *model = agModelForTab(self.activeModeTab);
     NSString *apiKey = agAPIKeyForTab(self.activeModeTab);
@@ -5388,7 +5426,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     if (!agIsWebSocketBidiCapableModel(model, self.activeModeTab)) return;
 
     self.isWarmStandbyMode = YES;
-    self.lastDismissTimestamp = [[NSDate date] timeIntervalSince1970];
+    self.lastDismissTimestamp = now;
     self.activeWebSocketModel = model;
     agLiveDiagLog(@"WS_PREWARM", @"Pre-warming WebSocket in background for model %@", model);
     [self startWebSocketBidiSessionWithModel:model forTab:self.activeModeTab];
@@ -5536,6 +5574,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     pauseBackgroundMediaPlayback();
     self.isDismissed = NO;
     self.isWarmStandbyMode = NO;
+    self.lastTriggerTime = [[NSDate date] timeIntervalSince1970];
     [self.wsKeepAlivePingTimer invalidate];
     self.wsKeepAlivePingTimer = nil;
     self.wsReconnectCount = 0;
@@ -5543,21 +5582,34 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     self.hasAutoMigratedDeprecatedModel = NO;
 
     NSString *curModel = agModelForTab(tab);
-    // ✅ 修复：必须同时满足 isWebSocketConnected && isSetupHandshakeCompleted 才是真正存活的热备连接
+    // ✅ 关键优化：只要后台 WebSocket 任务正在运行（无论是已完成握手，还是刚在后台连接了一半），都直接无缝接管并立即打开麦克风！
     if ((tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI) &&
         curModel.length > 0 &&
-        self.isWebSocketConnected &&
-        self.isSetupHandshakeCompleted &&
         self.liveWebSocketTask &&
         self.liveWebSocketTask.state == NSURLSessionTaskStateRunning &&
         [self.activeWebSocketModel isEqualToString:curModel]) {
-        [self startWebSocketBidiSessionWithModel:curModel forTab:tab];
+        [self setupAndStartFullDuplexPCMAudioEngine];
+        if (self.isSetupHandshakeCompleted) {
+            self.subStatusLabel.text = (tab == AGConfigTabVideoAI)
+                ? @"📞📹 实时视频通话已就绪 (请直接说话)..."
+                : @"📞 实时语音通话已就绪 (请直接说话)...";
+            agLiveDiagLog(@"WS_FAST_REUSE", @"0ms instant reuse of warm WebSocket for %@", curModel);
+        } else {
+            self.subStatusLabel.text = @"🎙️ 请直接开口说话 (0秒预录收音中)...";
+            agLiveDiagLog(@"WS_INFLIGHT_ADOPT", @"Adopted in-flight prewarm WebSocket for %@", curModel);
+        }
         return;
     }
 
     [self stopAllVoiceEngines];
     self.isDismissed = NO;
     self.isWarmStandbyMode = NO;
+    // 在发起网络请求前，第 0.00 秒立即启动全双工麦克风引擎进入预录状态，保证用户马上说话 100% 被录下！
+    if (tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI) {
+        self.subStatusLabel.text = @"🎙️ 请直接开口说话 (0秒预录收音中)...";
+        [self setupAndStartFullDuplexPCMAudioEngine];
+    }
+
     [self ensureCloudModelsLoadedForTab:tab completion:^(NSString *readyModel) {
         if (tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI || agIsWebSocketBidiCapableModel(readyModel, tab)) {
             NSString *targetModel = readyModel;
@@ -5631,9 +5683,10 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         self.webSocketSession = nil;
     }
 
-    // ✅ 核心修复：必须先递增 sessionGenerationToken，然后再启动麦克风引擎！
-    // 否则麦克风引擎捕获旧 Token 后会在 1 毫秒后因 Token 不一致而自我销毁！
-    ++self.sessionGenerationToken;
+    // ✅ 修复：若麦克风引擎已在运行，不重新递增 Token 避免误杀已打开的收音
+    if (!self.liveAudioEngine || !self.liveAudioEngine.isRunning) {
+        ++self.sessionGenerationToken;
+    }
 
     self.webSocketSession = agCreateSessionWithProxy(proxy, self, [NSOperationQueue mainQueue]);
     self.liveWebSocketTask = [self.webSocketSession webSocketTaskWithRequest:wsReq];
@@ -5857,6 +5910,17 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     }
     if (!preRoll || preRoll.length == 0) return;
 
+    // 关键修复：先发送 100ms (3200 bytes) 的零电平静音基准帧，让 Gemini / 千问云端 VAD 建立噪声基线，100% 触发人声起音检测！
+    NSMutableData *silenceLead = [NSMutableData dataWithLength:3200];
+    NSString *silenceB64 = [silenceLead base64EncodedStringWithOptions:0];
+    if (self.isGoogleBidiProtocol) {
+        [self sendJSONDictionaryOverWebSocket:@{
+            @"realtimeInput": @{ @"audio": @{ @"mimeType": @"audio/pcm;rate=16000", @"data": silenceB64 } }
+        }];
+    } else {
+        [self sendJSONDictionaryOverWebSocket:agBuildVendorAudioAppendPacket(silenceB64)];
+    }
+
     NSUInteger chunkSz = 3200;
     for (NSUInteger offset = 0; offset < preRoll.length; offset += chunkSz) {
         NSUInteger thisLen = MIN(chunkSz, preRoll.length - offset);
@@ -5870,7 +5934,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             [self sendJSONDictionaryOverWebSocket:agBuildVendorAudioAppendPacket(b64)];
         }
     }
-    agLiveDiagLog(@"PREROLL_SENT", @"Flushed %lu bytes of pre-roll audio on setupComplete", (unsigned long)preRoll.length);
+    agLiveDiagLog(@"PREROLL_SENT", @"Flushed 3200B silence lead + %lu bytes of pre-roll audio on setupComplete", (unsigned long)preRoll.length);
 }
 
 - (void)handleIncomingWebSocketJSON:(NSDictionary *)json {
@@ -6220,13 +6284,14 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     });
 }
 
-// 生成 iOS 26 Siri (Apple Intelligence) 标志性空灵双音液态琉璃启动音 WAV 数据 (全生命周期只合成 1 次，0 开销)
-static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
-    static NSData *sChimeWAV = nil;
+// 生成并缓存 iOS 26 Siri 空灵液态琉璃双音提示音文件与 SystemSoundID
+static SystemSoundID agGetIOS26SiriChimeSystemSoundID(void) {
+    static SystemSoundID sSoundID = 0;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        NSString *wavPath = @"/tmp/ag_ios26_siri_chime_v2.wav";
         uint32_t sampleRate = 48000;
-        double duration = 0.34; // 340ms 饱满双音与空灵混响尾韵
+        double duration = 0.34;
         uint32_t totalFrames = (uint32_t)(sampleRate * duration);
         uint32_t dataSize = totalFrames * sizeof(int16_t);
         uint32_t fileSize = 36 + dataSize;
@@ -6250,70 +6315,57 @@ static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
             for (uint32_t i = 0; i < totalFrames; i++) {
                 float t = (float)i / (float)sampleRate;
                 float sample = 0.0f;
-
-                // 第一音 (0.00s ~ 0.14s)：iOS 26 Siri 低频暖感共鸣基底 (D4 293.66Hz + D5 587.33Hz + A5 泛音)
+                // 第一音 (0.00s ~ 0.14s): iOS 26 Siri 低频共鸣基底 D4 (293.66Hz) + D5 (587.33Hz) + D6
                 if (t < 0.14f) {
                     float env1 = (t < 0.006f) ? (t / 0.006f) : expf(-(t - 0.006f) * 24.0f);
-                    float tone1 = sinf(2.0f * (float)M_PI * 293.66f * t) * 0.32f
-                                + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f
-                                + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.16f;
-                    sample += tone1 * env1;
+                    sample += (sinf(2.0f * (float)M_PI * 293.66f * t) * 0.34f
+                             + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f
+                             + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.14f) * env1;
                 }
-
-                // 第二音 (0.070s ~ 0.34s)：上行五度空灵绽放和弦 (A5 880Hz + 大三度 C#6 1318.5Hz + 晶莹八度 A6 1760Hz)
+                // 第二音 (0.070s ~ 0.34s): 上行五度空灵绽放和弦 A5 (880Hz) + C#6 (1318.5Hz) + A6 (1760Hz)
                 if (t >= 0.070f) {
                     float t2 = t - 0.070f;
-                    float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.5f);
-                    float tone2 = sinf(2.0f * (float)M_PI * 440.00f * t2) * 0.22f
-                                + sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.50f
-                                + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.18f
-                                + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.10f;
-                    sample += tone2 * env2;
+                    float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.0f);
+                    sample += (sinf(2.0f * (float)M_PI * 440.00f * t2) * 0.22f
+                             + sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.52f
+                             + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.18f
+                             + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.10f) * env2;
                 }
-
-                sample *= 0.78f; // 饱满清晰响度，穿透硬件增益爬坡
-                if (sample > 0.98f) sample = 0.98f;
-                else if (sample < -0.98f) sample = -0.98f;
+                sample = MAX(-0.98f, MIN(0.98f, sample * 0.85f));
                 pcm[i] = (int16_t)(sample * 32767.0f);
             }
             [wav appendBytes:pcm length:dataSize];
             free(pcm);
         }
-        sChimeWAV = [wav copy];
+        [wav writeToFile:wavPath atomically:YES];
+        AudioServicesCreateSystemSoundID((__bridge CFURLRef)[NSURL fileURLWithPath:wavPath], &sSoundID);
     });
-    return sChimeWAV;
+    return sSoundID;
 }
 
 - (void)playCrystalWakeupChimeIfNeeded {
     if (!self.pendingWakeupChime) return;
+    if (self.isDismissed || self.isWarmStandbyMode) return;
+
+    // 1. 呼出瞬间先通过 SystemSound 独立系统硬件混音通道立即发声（不消耗 pendingWakeupChime 标志，留给音频引擎启动后二次补强）
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    // 防止同一次唤醒重复播放两次
-    if (now - self.lastChimePlayTimestamp < 0.65) {
-        self.pendingWakeupChime = NO;
-        return;
+    if (now - self.lastChimePlayTimestamp >= 0.60) {
+        self.lastChimePlayTimestamp = now;
+        SystemSoundID sid = agGetIOS26SiriChimeSystemSoundID();
+        if (sid != 0) {
+            AudioServicesPlaySystemSound(sid);
+        }
     }
+
+    // 2. 当全双工 AVAudioEngine 真正启动就绪后，通过 pcmPlayerNode 播放（即使手机拨片处于静音模式也 100% 必响！）
+    if (!self.liveAudioEngine || !self.liveAudioEngine.isRunning || !self.pcmPlayerNode || !self.playerOutputFormat) {
+        return; // 此时引擎尚未完成启动，保持 pendingWakeupChime = YES，等引擎启动完成那一行再次调用！
+    }
+
     self.pendingWakeupChime = NO;
-    self.lastChimePlayTimestamp = now;
-    // 开启 340ms 麦克风防串音保护窗，防止提示音被录进预录缓冲发给 AI
-    self.chimeMuteUntilTimestamp = now + 0.34;
-
-    // 通道 A：立即通过 AVAudioPlayer 播放内存 WAV，确保呼出第 0 秒清脆必响
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            NSData *wavData = agGetIOS26SiriInvocationChimeWAVData();
-            if (wavData.length > 44) {
-                self.wakeupChimePlayer = [[AVAudioPlayer alloc] initWithData:wavData error:nil];
-                self.wakeupChimePlayer.volume = 0.92f;
-                [self.wakeupChimePlayer prepareToPlay];
-                [self.wakeupChimePlayer play];
-            }
-        } @catch (NSException *e) {}
-    });
-
-    // 通道 B：若全双工 VoiceProcessingIO 引擎正在启动/运行，延迟 95ms（避开硬件前 85ms 路由切换吞音期）注入 pcmPlayerNode 双重保障
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.095 * NSEC_PER_SEC)), self.audioPlayQueue, ^{
+    // 延迟 65ms 避开 VoiceProcessingIO 刚启动时的硬件静音爬坡期
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.065 * NSEC_PER_SEC)), self.audioPlayQueue, ^{
         if (self.isDismissed || self.isWarmStandbyMode || !self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
-        if (self.wakeupChimePlayer && self.wakeupChimePlayer.isPlaying) return; // 若通道 A 已正常发声则不叠加
 
         double sampleRate = self.playerOutputFormat.sampleRate > 0 ? self.playerOutputFormat.sampleRate : 48000.0;
         AVAudioChannelCount channels = MAX(1, self.playerOutputFormat.channelCount);
@@ -6327,14 +6379,17 @@ static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
             float sample = 0.0f;
             if (t < 0.14f) {
                 float env1 = (t < 0.006f) ? (t / 0.006f) : expf(-(t - 0.006f) * 24.0f);
-                sample += (sinf(2.0f * (float)M_PI * 293.66f * t) * 0.32f + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f) * env1;
+                sample += (sinf(2.0f * (float)M_PI * 293.66f * t) * 0.34f
+                         + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f) * env1;
             }
             if (t >= 0.070f) {
                 float t2 = t - 0.070f;
-                float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.5f);
-                sample += (sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.52f + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.20f + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.12f) * env2;
+                float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.0f);
+                sample += (sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.52f
+                         + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.18f
+                         + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.10f) * env2;
             }
-            sample = MAX(-0.98f, MIN(0.98f, sample * 0.78f));
+            sample = MAX(-0.98f, MIN(0.98f, sample * 0.82f));
             for (AVAudioChannelCount ch = 0; ch < channels; ch++) {
                 if (chimeBuf.floatChannelData[ch]) chimeBuf.floatChannelData[ch][i] = sample;
             }
@@ -6342,6 +6397,7 @@ static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
         if (!self.liveAudioEngine.isRunning) [self.liveAudioEngine startAndReturnError:nil];
         if (!self.pcmPlayerNode.isPlaying) [self.pcmPlayerNode play];
         [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:nil];
+        agLiveDiagLog(@"CHIME_PLAYED", @"Played iOS 26 Siri invocation chime on pcmPlayerNode");
     });
 }
 
@@ -6437,8 +6493,7 @@ static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
 - (void)processMicrophoneInputPCMBuffer:(AVAudioPCMBuffer *)buffer {
     if (!buffer || buffer.frameLength == 0 || buffer.floatChannelData == NULL) return;
 
-    // 播放启动水晶提示音的 240ms 内暂不采集麦克风，防止提示音本身被录进预录缓冲区发给 AI
-    if ([[NSDate date] timeIntervalSince1970] < self.chimeMuteUntilTimestamp) return;
+    // ✅ 硬件 AEC 已开启，不丢弃任何刚启动时用户的开口语音
 
     AVAudioFrameCount inFrames = buffer.frameLength;
     double inSampleRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000.0;
@@ -9837,7 +9892,40 @@ static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
 }
 %end
 
+%hook SBAssistantWindow
+- (void)setHidden:(BOOL)hidden {
+    if (!hidden && [[GeminiAssistantManager sharedManager] isTweakEnabled]) {
+        %orig(YES);
+        self.alpha = 0.0;
+        agWakeScreenBacklightIfNeeded();
+        [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
+        return;
+    }
+    %orig(hidden);
+}
+- (void)makeKeyAndVisible {
+    if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
+        self.hidden = YES;
+        self.alpha = 0.0;
+        agWakeScreenBacklightIfNeeded();
+        [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
+        return;
+    }
+    %orig;
+}
+%end
+
 %hook SBAssistantController
+- (void)siriPresentation:(id)arg1 requestsPresentationWithOptions:(id)arg2 withHandler:(void (^)(BOOL))handler {
+    if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
+        if (handler) handler(NO);
+        agWakeScreenBacklightIfNeeded();
+        [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
+        [[GeminiAssistantManager sharedManager] forceKillNativeSiri];
+        return;
+    }
+    %orig(arg1, arg2, handler);
+}
 - (void)_activateSiriWithContext:(id)context {
     if ([[GeminiAssistantManager sharedManager] isTweakEnabled] && !isDeviceCurrentlyLocked()) {
         [GeminiAssistantManager sharedManager].isInvocationFromPowerButton = NO;
@@ -9870,35 +9958,18 @@ static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
 %end
 
 %hook SiriPresentationSpringBoardMainScreenViewController
-- (void)requestSiriPresentation:(id)arg1 withOptions:(id)arg2 {
-    if ([[GeminiAssistantManager sharedManager] isTweakEnabled] && !isDeviceCurrentlyLocked()) {
-        if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
-            [self dismissSiriViewController:nil withReason:0];
-        } else if ([self respondsToSelector:@selector(dismissSiriViewController:)]) {
-            [self dismissSiriViewController:nil];
-        }
-        [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
-        return;
-    }
-    %orig(arg1, arg2);
-}
-- (void)_activateSiriWithContext:(id)context {
-    if ([[GeminiAssistantManager sharedManager] isTweakEnabled] && !isDeviceCurrentlyLocked()) {
-        [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
-        return;
-    }
-    %orig(context);
+- (BOOL)_canShowWhileLocked {
+    return YES;
 }
 - (void)viewWillAppear:(BOOL)animated {
-    if ([[GeminiAssistantManager sharedManager] isTweakEnabled] && !isDeviceCurrentlyLocked()) {
-        self.view.hidden = YES;
+    if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
         self.view.alpha = 0.0;
-        if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
-            [self dismissSiriViewController:nil withReason:0];
-        } else if ([self respondsToSelector:@selector(dismissSiriViewController:)]) {
-            [self dismissSiriViewController:nil];
-        }
+        self.view.hidden = YES;
+        agWakeScreenBacklightIfNeeded();
         [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
+        if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
+            [self dismissSiriViewController:self withReason:1];
+        }
         return;
     }
     %orig(animated);
