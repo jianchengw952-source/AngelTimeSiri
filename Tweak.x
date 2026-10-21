@@ -5250,9 +5250,13 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 // 亮屏/后台静默预连：只建立 WebSocket 与 setup 握手，绝不启动 AVAudioEngine，不影响音量与嘿 Siri
 - (void)prewarmWebSocketInBackgroundIfNeeded {
     if (![self isTweakEnabled]) return;
+    // ✅ 修复：如果当前悬浮窗已经弹出显示，严禁触发后台预热覆写 isWarmStandbyMode！
+    if (!self.isDismissed && self.overlayWindow && !self.overlayWindow.hidden && self.overlayWindow.alpha > 0.05) {
+        return;
+    }
     if (self.activeModeTab == AGConfigTabPureText || self.activeModeTab == AGConfigTabTranslation) return;
-    if (self.isWebSocketConnected && self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
-        return; // 已在线，无需重复连接
+    if (self.isWebSocketConnected && self.isSetupHandshakeCompleted && self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
+        return; // 已在线且完成握手，无需重复连接
     }
     NSString *model = agModelForTab(self.activeModeTab);
     NSString *apiKey = agAPIKeyForTab(self.activeModeTab);
@@ -5408,14 +5412,18 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     pauseBackgroundMediaPlayback();
     self.isDismissed = NO;
     self.isWarmStandbyMode = NO;
+    [self.wsKeepAlivePingTimer invalidate];
+    self.wsKeepAlivePingTimer = nil;
     self.wsReconnectCount = 0;
     self.disableTranscriptionInSetup = NO;
     self.hasAutoMigratedDeprecatedModel = NO;
 
     NSString *curModel = agModelForTab(tab);
-    // 关键优化：如果后台热备或预热的 WebSocket 已经连着同一个模型，绝不调用 stopAllVoiceEngines 掐断它！直接 0 秒无缝接通麦克风！
+    // ✅ 修复：必须同时满足 isWebSocketConnected && isSetupHandshakeCompleted 才是真正存活的热备连接
     if ((tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI) &&
         curModel.length > 0 &&
+        self.isWebSocketConnected &&
+        self.isSetupHandshakeCompleted &&
         self.liveWebSocketTask &&
         self.liveWebSocketTask.state == NSURLSessionTaskStateRunning &&
         [self.activeWebSocketModel isEqualToString:curModel]) {
@@ -5424,6 +5432,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     }
 
     [self stopAllVoiceEngines];
+    self.isDismissed = NO;
+    self.isWarmStandbyMode = NO;
     [self ensureCloudModelsLoadedForTab:tab completion:^(NSString *readyModel) {
         if (tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI || agIsWebSocketBidiCapableModel(readyModel, tab)) {
             NSString *targetModel = readyModel;
@@ -5451,31 +5461,26 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     self.activeWebSocketModel = cleanModel;
     NSString *exactModelID = [cleanModel stringByReplacingOccurrencesOfString:@"models/" withString:@""];
 
-    // 情况 A：后台热备 WebSocket 已完成握手（或正在握手），0.00 秒瞬时复用并直接打开麦克风收音！
-    if (self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning && [self.activeWebSocketModel isEqualToString:cleanModel]) {
+    // ✅ 情况 A：仅当后台热备连接真正处于 isWebSocketConnected && isSetupHandshakeCompleted 时才复用
+    if (self.isWebSocketConnected && self.isSetupHandshakeCompleted &&
+        self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning &&
+        [self.activeWebSocketModel isEqualToString:cleanModel]) {
         if (!self.isWarmStandbyMode && self.overlayWindow && !self.overlayWindow.hidden) {
+            [self.wsKeepAlivePingTimer invalidate];
+            self.wsKeepAlivePingTimer = nil;
             [self setupAndStartFullDuplexPCMAudioEngine];
-            if (self.isSetupHandshakeCompleted) {
-                self.subStatusLabel.text = (tab == AGConfigTabVideoAI)
-                    ? @"📞📹 实时视频通话已就绪 (请直接说话)..."
-                    : @"📞 实时语音通话已就绪 (请直接说话)...";
-                agLiveDiagLog(@"WS_FAST_REUSE", @"0ms instant reuse of warm WebSocket for %@", exactModelID);
-            } else {
-                self.subStatusLabel.text = @"🎙️ 请直接说话 (正在同步云端通道)...";
-            }
+            self.subStatusLabel.text = (tab == AGConfigTabVideoAI)
+                ? @"📞📹 实时视频通话已就绪 (请直接说话)..."
+                : @"📞 实时语音通话已就绪 (请直接说话)...";
+            agLiveDiagLog(@"WS_FAST_REUSE", @"0ms instant reuse of warm WebSocket for %@", exactModelID);
         }
         return;
     }
 
     self.isGoogleBidiProtocol = agIsGoogleNativeProtocol(endpoint, cleanModel);
+    self.isWebSocketConnected = NO;
     self.isSetupHandshakeCompleted = NO;
     self.aiPlaybackEndTime = 0;
-
-    // 情况 B：若当前是用户呼出主界面（非后台静默预连），第 0.00 秒立即启动麦克风引擎进入预录状态，用户无需等待即可开口说话！
-    if (!self.isWarmStandbyMode && self.overlayWindow && !self.overlayWindow.hidden && self.activeModeTab != AGConfigTabPureText) {
-        self.subStatusLabel.text = @"🎙️ 请直接开口说话 (已开启 0 秒预录收音)...";
-        [self setupAndStartFullDuplexPCMAudioEngine];
-    }
 
     NSMutableURLRequest *wsReq = nil;
     if (self.isGoogleBidiProtocol) {
@@ -5502,11 +5507,19 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         self.webSocketSession = nil;
     }
 
+    // ✅ 核心修复：必须先递增 sessionGenerationToken，然后再启动麦克风引擎！
+    // 否则麦克风引擎捕获旧 Token 后会在 1 毫秒后因 Token 不一致而自我销毁！
     ++self.sessionGenerationToken;
+
     self.webSocketSession = agCreateSessionWithProxy(proxy, self, [NSOperationQueue mainQueue]);
     self.liveWebSocketTask = [self.webSocketSession webSocketTaskWithRequest:wsReq];
     [self.liveWebSocketTask resume];
     [self receiveNextWebSocketMessage];
+
+    if (!self.isWarmStandbyMode && self.overlayWindow && !self.overlayWindow.hidden && self.activeModeTab != AGConfigTabPureText) {
+        self.subStatusLabel.text = [NSString stringWithFormat:@"🎙️ 请直接开口说话 (正在连接 %@)...", exactModelID];
+        [self setupAndStartFullDuplexPCMAudioEngine];
+    }
 }
 
 - (void)URLSession:(NSURLSession *)session webSocketTask:(NSURLSessionWebSocketTask *)webSocketTask didOpenWithProtocol:(NSString *)protocol {
@@ -5656,7 +5669,14 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             }
             agLiveDiagLog(@"WS_RECV_ERR", @"WebSocket receive error (model=%@, retry=%ld): %@", boundModel, (long)strongSelf.wsReconnectCount, error.localizedDescription);
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (boundTask != strongSelf.liveWebSocketTask || !strongSelf.overlayWindow || strongSelf.overlayWindow.hidden || strongSelf.activeModeTab == AGConfigTabPureText) return;
+                if (boundTask != strongSelf.liveWebSocketTask) return;
+                // ✅ 修复：报错后立即标记断开并清理死 Task，防止 retry 时误入 WS_FAST_REUSE 死循环
+                strongSelf.isWebSocketConnected = NO;
+                strongSelf.isSetupHandshakeCompleted = NO;
+                [strongSelf.liveWebSocketTask cancel];
+                strongSelf.liveWebSocketTask = nil;
+
+                if (!strongSelf.overlayWindow || strongSelf.overlayWindow.hidden || strongSelf.activeModeTab == AGConfigTabPureText) return;
                 if (strongSelf.wsReconnectCount < 2) {
                     strongSelf.wsReconnectCount++;
                     if (strongSelf.wsReconnectCount == 1 && !strongSelf.disableTranscriptionInSetup && ![boundModel containsString:@"3.8"]) {
@@ -5763,7 +5783,10 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             self.wsReconnectCount = 0;
             [self flushPreRollPCMBufferIfNeeded];
             agLiveDiagLog(@"WS_SETUP_COMPLETE", @"Handshake completed for model %@", self.activeWebSocketModel);
-            if (!self.isWarmStandbyMode) {
+            if (!self.isWarmStandbyMode && self.overlayWindow && !self.overlayWindow.hidden) {
+                if (!self.liveAudioEngine || !self.liveAudioEngine.isRunning) {
+                    [self setupAndStartFullDuplexPCMAudioEngine];
+                }
                 self.subStatusLabel.text = (self.activeModeTab == AGConfigTabVideoAI)
                     ? @"📞📹 实时视频通话中 (直接说话，支持随时插话打断)..."
                     : @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
@@ -6277,9 +6300,18 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 }
 
 - (void)handleAudioSessionInterruption:(NSNotification *)note {
+    if (self.isDismissed || self.isWarmStandbyMode || !self.overlayWindow || self.overlayWindow.hidden) return;
     NSUInteger type = [note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
     agLiveDiagLog(@"AUDIO_INTERRUPT", @"AVAudioSession interruption type=%lu", (unsigned long)type);
-    if (type == AVAudioSessionInterruptionTypeEnded && !self.isDismissed && self.overlayWindow && !self.overlayWindow.hidden && self.isWebSocketConnected) {
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+        // ✅ 修复：当窗口在前台被原生 assistantd 闪断(type=1)时，0.25s 后自动夺回麦克风并恢复收音
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!self.isDismissed && !self.isWarmStandbyMode && self.overlayWindow && !self.overlayWindow.hidden && self.activeModeTab != AGConfigTabPureText) {
+                [self forceKillNativeSiri];
+                [self setupAndStartFullDuplexPCMAudioEngine];
+            }
+        });
+    } else if (type == AVAudioSessionInterruptionTypeEnded) {
         [self setupAndStartFullDuplexPCMAudioEngine];
     }
 }
