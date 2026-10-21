@@ -355,6 +355,53 @@ static NSArray<NSDictionary *> *agVerifiedDefaultModelsForTab(AGConfigTab tab) {
 - (BOOL)lockUIFromSource:(NSInteger)source withOptions:(id)options;
 @end
 
+@interface SBBacklightController : NSObject
++ (instancetype)sharedInstance;
++ (instancetype)sharedInstanceIfExists;
+@property (nonatomic, readonly) BOOL screenIsOn;
+- (void)turnOnScreenFullyWithBacklightSource:(NSInteger)source;
+- (void)_undimFromSource:(NSInteger)source;
+@end
+
+@interface SBLockScreenManager (AGWakeAdditions)
+- (void)requestUserAttentionScreenWakeFromSource:(NSInteger)source reason:(NSString *)reason;
+@end
+
+@interface AGLockScreenRootViewController : UIViewController
+@end
+@implementation AGLockScreenRootViewController
+- (BOOL)_canShowWhileLocked { return YES; }
+@end
+
+// 锁屏/息屏状态下主动点亮屏幕硬件背光，解决“嘿 Siri”或电源键唤醒时屏幕不亮的问题
+static void agWakeScreenBacklightIfNeeded(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            Class blCls = objc_getClass("SBBacklightController");
+            if (blCls) {
+                SBBacklightController *bl = [blCls respondsToSelector:@selector(sharedInstanceIfExists)]
+                    ? [blCls sharedInstanceIfExists]
+                    : ([blCls respondsToSelector:@selector(sharedInstance)] ? [blCls sharedInstance] : nil);
+                if (bl) {
+                    if ([bl respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) {
+                        [bl turnOnScreenFullyWithBacklightSource:1];
+                    }
+                    if ([bl respondsToSelector:@selector(_undimFromSource:)]) {
+                        [bl _undimFromSource:1];
+                    }
+                }
+            }
+            Class lsmCls = objc_getClass("SBLockScreenManager");
+            if (lsmCls && [lsmCls respondsToSelector:@selector(sharedInstanceIfExists)]) {
+                SBLockScreenManager *lsm = [lsmCls sharedInstanceIfExists];
+                if (lsm && [lsm respondsToSelector:@selector(requestUserAttentionScreenWakeFromSource:reason:)]) {
+                    [lsm requestUserAttentionScreenWakeFromSource:1 reason:@"AngelGuardianSiriWake"];
+                }
+            }
+        } @catch (NSException *e) {}
+    });
+}
+
 @interface SBAssistantController : NSObject
 + (instancetype)sharedInstance;
 + (BOOL)isVisible;
@@ -2295,6 +2342,7 @@ static void agFetchCloudModelsForTab(AGConfigTab tab, NSString *endpoint, NSStri
 @end
 
 @implementation GeminiPassthroughWindow
+- (BOOL)_canShowWhileLocked { return YES; }
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
     if (self.hidden || self.alpha < 0.05 || !self.capsuleWrapper) return NO;
     if (self.lockFullScreenTouch) return YES;
@@ -2306,6 +2354,7 @@ static void agFetchCloudModelsForTab(AGConfigTab tab, NSString *endpoint, NSStri
 
 // ==================== 全局灵动胶囊反馈悬浮窗 (模块 E1) ====================
 @implementation AGGlobalActionPillWindow
+- (BOOL)_canShowWhileLocked { return YES; }
 
 + (instancetype)sharedPill {
     static AGGlobalActionPillWindow *pill = nil;
@@ -2936,6 +2985,7 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, strong) CAShapeLayer *screenNeonBloomMask;
 @property (nonatomic, strong) CAShapeLayer *screenNeonOuterMask;       // 外层：锐利流光核心边
 @property (nonatomic, strong) CAGradientLayer *invocationFlareLayer;   // 电源键/嘿Siri唤醒聚能闪光层
+@property (nonatomic, strong) CAGradientLayer *invocationSweepLayer;   // iOS 26 全屏动态光幕扫光层
 @property (nonatomic, assign) CGFloat marqueeSweepProgress;            // 唤醒跑马灯环绕进度 (0.0 ~ 1.0)
 @property (nonatomic, assign) BOOL isInvocationFromPowerButton;        // 标记唤醒源：YES=电源键, NO=嘿Siri语音
 
@@ -3106,6 +3156,8 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, assign) BOOL isWarmStandbyMode;
 @property (nonatomic, assign) BOOL pendingWakeupChime;
 @property (nonatomic, assign) NSTimeInterval chimeMuteUntilTimestamp;
+@property (nonatomic, strong) AVAudioPlayer *wakeupChimePlayer;        // 独立低延迟启动提示音播放器
+@property (nonatomic, assign) NSTimeInterval lastChimePlayTimestamp;   // 防重复触发时间戳
 - (void)playCrystalWakeupChimeIfNeeded;
 - (void)suspendVoiceSessionKeepWebSocketAlive;
 - (void)prewarmWebSocketInBackgroundIfNeeded;
@@ -3554,9 +3606,10 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     NSArray *featherColors = nil;
     NSArray *bloomColors = nil;
     NSArray *flareColors = nil;
+    NSArray *sweepColors = nil;
 
     if (theme == AGVisualThemeLightLuxury) {
-        // 1. 轻奢：18K 香槟亮金 + 熔岩流金 + 暖珀金环绕 (首尾闭合防接缝)
+        // 1. 轻奢主题：18K 香槟亮金 + 熔岩流金 + 暖珀金环绕与全屏金芒扫光
         coreColors = @[
             (__bridge id)[UIColor colorWithRed:1.00 green:0.93 blue:0.70 alpha:1.0].CGColor,
             (__bridge id)[UIColor colorWithRed:0.96 green:0.68 blue:0.24 alpha:1.0].CGColor,
@@ -3568,18 +3621,25 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         ];
         featherColors = coreColors;
         bloomColors = @[
-            (__bridge id)[UIColor colorWithRed:0.99 green:0.80 blue:0.38 alpha:0.90].CGColor,
-            (__bridge id)[UIColor colorWithRed:0.85 green:0.52 blue:0.18 alpha:0.75].CGColor,
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.92 blue:0.68 alpha:0.92].CGColor,
-            (__bridge id)[UIColor colorWithRed:0.99 green:0.80 blue:0.38 alpha:0.90].CGColor
+            (__bridge id)[UIColor colorWithRed:0.99 green:0.80 blue:0.38 alpha:0.92].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.85 green:0.52 blue:0.18 alpha:0.78].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.92 blue:0.68 alpha:0.94].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.99 green:0.80 blue:0.38 alpha:0.92].CGColor
         ];
         flareColors = @[
             (__bridge id)[UIColor whiteColor].CGColor,
             (__bridge id)[UIColor colorWithRed:1.00 green:0.86 blue:0.48 alpha:0.95].CGColor,
             (__bridge id)[UIColor clearColor].CGColor
         ];
+        sweepColors = @[
+            (__bridge id)[UIColor clearColor].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.96 green:0.68 blue:0.24 alpha:0.22].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.94 blue:0.76 alpha:0.58].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.98 green:0.78 blue:0.36 alpha:0.25].CGColor,
+            (__bridge id)[UIColor clearColor].CGColor
+        ];
     } else if (theme == AGVisualThemeMinimalist) {
-        // 2. 简约：极地纯白 + 冰川天蓝 + 星云浅紫超折射流光
+        // 2. 简约主题：极地纯白 + 冰川天蓝 + 星云浅紫超折射流光与全屏冰晶扫光
         coreColors = @[
             (__bridge id)[UIColor whiteColor].CGColor,
             (__bridge id)[UIColor colorWithRed:0.22 green:0.78 blue:1.00 alpha:1.0].CGColor,
@@ -3592,8 +3652,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         featherColors = coreColors;
         bloomColors = @[
             (__bridge id)[UIColor colorWithRed:0.35 green:0.82 blue:1.00 alpha:0.92].CGColor,
-            (__bridge id)[UIColor colorWithRed:0.51 green:0.55 blue:0.98 alpha:0.80].CGColor,
-            (__bridge id)[UIColor colorWithWhite:1.0 alpha:0.90].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.51 green:0.55 blue:0.98 alpha:0.82].CGColor,
+            (__bridge id)[UIColor colorWithWhite:1.0 alpha:0.92].CGColor,
             (__bridge id)[UIColor colorWithRed:0.35 green:0.82 blue:1.00 alpha:0.92].CGColor
         ];
         flareColors = @[
@@ -3601,32 +3661,46 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             (__bridge id)[UIColor colorWithRed:0.38 green:0.86 blue:1.00 alpha:0.95].CGColor,
             (__bridge id)[UIColor clearColor].CGColor
         ];
+        sweepColors = @[
+            (__bridge id)[UIColor clearColor].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.22 green:0.78 blue:1.00 alpha:0.24].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.92 green:0.98 blue:1.00 alpha:0.60].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.56 green:0.62 blue:0.98 alpha:0.26].CGColor,
+            (__bridge id)[UIColor clearColor].CGColor
+        ];
     } else {
-        // 3. 炫酷：1:1 复刻真机实拍图 iOS 27 Siri 色彩分布 (右侧暖金橙 -> 底部饱满电光青蓝 -> 左侧星云紫与品红粉 -> 顶部灵动岛暖阳金橙)
+        // 3. 炫酷主题：1:1 复刻 iOS 26 Siri 全息虹彩流光与全屏极光扫光
         coreColors = @[
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.91 blue:0.52 alpha:1.0].CGColor, // 右侧中段：亮暖金黄
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.58 blue:0.00 alpha:1.0].CGColor, // 右下过渡：琥珀橙
-            (__bridge id)[UIColor colorWithRed:0.00 green:0.85 blue:1.00 alpha:1.0].CGColor, // 右下至底部：电光青蓝
-            (__bridge id)[UIColor colorWithRed:0.11 green:0.39 blue:1.00 alpha:1.0].CGColor, // 底部正中：饱满深邃宝蓝
-            (__bridge id)[UIColor colorWithRed:0.66 green:0.33 blue:0.97 alpha:1.0].CGColor, // 左下至左侧：星云紫
-            (__bridge id)[UIColor colorWithRed:0.93 green:0.28 blue:0.60 alpha:1.0].CGColor, // 左侧中上：Siri 品红粉
-            (__bridge id)[UIColor colorWithRed:0.39 green:0.40 blue:0.95 alpha:1.0].CGColor, // 左上角：靛蓝紫
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.42 blue:0.00 alpha:1.0].CGColor, // 顶部灵动岛至右上：暖阳金橙
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.91 blue:0.52 alpha:1.0].CGColor  // 完美闭合回右侧亮暖金黄
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.91 blue:0.52 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.58 blue:0.00 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.00 green:0.85 blue:1.00 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.11 green:0.39 blue:1.00 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.66 green:0.33 blue:0.97 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.93 green:0.28 blue:0.60 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.39 green:0.40 blue:0.95 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.42 blue:0.00 alpha:1.0].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.91 blue:0.52 alpha:1.0].CGColor
         ];
         featherColors = coreColors;
         bloomColors = @[
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.75 blue:0.22 alpha:0.92].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.75 blue:0.22 alpha:0.94].CGColor,
             (__bridge id)[UIColor colorWithRed:0.00 green:0.80 blue:1.00 alpha:0.96].CGColor,
             (__bridge id)[UIColor colorWithRed:0.12 green:0.42 blue:1.00 alpha:0.95].CGColor,
-            (__bridge id)[UIColor colorWithRed:0.88 green:0.26 blue:0.68 alpha:0.92].CGColor,
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.52 blue:0.12 alpha:0.90].CGColor,
-            (__bridge id)[UIColor colorWithRed:1.00 green:0.75 blue:0.22 alpha:0.92].CGColor
+            (__bridge id)[UIColor colorWithRed:0.88 green:0.26 blue:0.68 alpha:0.94].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.52 blue:0.12 alpha:0.92].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.75 blue:0.22 alpha:0.94].CGColor
         ];
         flareColors = @[
             (__bridge id)[UIColor whiteColor].CGColor,
             (__bridge id)[UIColor colorWithRed:1.00 green:0.85 blue:0.42 alpha:0.96].CGColor,
             (__bridge id)[UIColor colorWithRed:0.00 green:0.85 blue:1.00 alpha:0.85].CGColor,
+            (__bridge id)[UIColor clearColor].CGColor
+        ];
+        sweepColors = @[
+            (__bridge id)[UIColor clearColor].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.00 green:0.88 blue:1.00 alpha:0.26].CGColor,
+            (__bridge id)[UIColor colorWithRed:0.95 green:0.32 blue:0.68 alpha:0.52].CGColor,
+            (__bridge id)[UIColor colorWithRed:1.00 green:0.72 blue:0.24 alpha:0.30].CGColor,
             (__bridge id)[UIColor clearColor].CGColor
         ];
     }
@@ -3637,6 +3711,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     self.screenNeonFeatherLayer.colors = featherColors;
     self.screenNeonBloomLayer.colors = bloomColors;
     self.invocationFlareLayer.colors = flareColors;
+    if (self.invocationSweepLayer) {
+        self.invocationSweepLayer.colors = sweepColors;
+    }
     [CATransaction commit];
 }
 
@@ -3679,69 +3756,104 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 }
 
 - (void)playIOS27SiriInvocationEffectFromPowerButton:(BOOL)fromPowerButton {
+    // 1. 锁屏或息屏唤醒时，第一时间点亮屏幕硬件背光
+    agWakeScreenBacklightIfNeeded();
+
     if (!self.overlayWindow) return;
     self.pendingWakeupChime = YES;
+    // 2. 立即触发 iOS 26 Siri 启动提示音（零延迟必响）
+    [self playCrystalWakeupChimeIfNeeded];
+
     CGRect sb = [UIScreen mainScreen].bounds;
 
-    // 1. 双阶物理震动反馈 (复刻 iOS 27 港版唤醒手感)
+    // 3. 双阶物理震动反馈 (复刻 iOS 26 唤醒手感)
     UIImpactFeedbackGenerator *rigidHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleRigid];
     [rigidHaptic impactOccurred];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.11 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self.impactHaptic impactOccurred];
     });
 
-    // 若用户在设置中关闭了跑马灯开关，则隐藏跑马灯容器并直接返回
     if (!agIsMarqueeEnabled()) {
         self.edgeGlowContainer.hidden = YES;
         return;
     }
     self.edgeGlowContainer.hidden = NO;
+    [self applyMarqueeThemeColors:agCurrentVisualTheme()];
 
-    // 2. 设置点火聚能光斑起点：电源键在右侧边缘 30% 高度处；嘿Siri在底部中心
+    // 4. 边缘点火聚能光斑：电源键从右侧 28% 高度处爆发；嘿 Siri 从底部正中爆发
     CGPoint flareOrigin = fromPowerButton
         ? CGPointMake(sb.size.width, sb.size.height * 0.28)
         : CGPointMake(sb.size.width * 0.50, sb.size.height);
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    self.invocationFlareLayer.bounds = CGRectMake(0, 0, 320, 320);
+    self.invocationFlareLayer.bounds = CGRectMake(0, 0, 360, 360);
     self.invocationFlareLayer.position = flareOrigin;
     self.invocationFlareLayer.opacity = 1.0;
     self.invocationFlareLayer.transform = CATransform3DMakeScale(0.18, 0.18, 1.0);
     [CATransaction commit];
 
-    // 聚能光斑沿边框瞬间双向包抄炸开并消散
     CABasicAnimation *flareScale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
     flareScale.fromValue = @(0.18);
-    flareScale.toValue = @(3.6);
+    flareScale.toValue = @(3.8);
     CABasicAnimation *flareFade = [CABasicAnimation animationWithKeyPath:@"opacity"];
     flareFade.fromValue = @(1.0);
     flareFade.toValue = @(0.0);
     CAAnimationGroup *flareGroup = [CAAnimationGroup animation];
     flareGroup.animations = @[flareScale, flareFade];
-    flareGroup.duration = 0.64;
+    flareGroup.duration = 0.68;
     flareGroup.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
     self.invocationFlareLayer.opacity = 0.0;
-    [self.invocationFlareLayer addAnimation:flareGroup forKey:@"agIOS27InvocationFlare"];
+    [self.invocationFlareLayer addAnimation:flareGroup forKey:@"agIOS26InvocationFlare"];
 
-    // 3. 全屏跑马灯与背景遮罩向心果冻内缩回弹 (iOS 27 标志性呼唤波纹)
-    self.edgeGlowContainer.transform = CGAffineTransformMakeScale(1.03, 1.03);
+    // 5. iOS 26 标志性全屏扫光 (Full-Screen Light Sweep)：
+    // 电源键唤醒：从右上电源键斜切扫向全屏左下；嘿 Siri 唤醒：从屏幕底部向上全屏冲刷扫过
+    if (self.invocationSweepLayer) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        self.invocationSweepLayer.frame = CGRectInset(sb, -sb.size.width * 0.5, -sb.size.height * 0.5);
+        if (fromPowerButton) {
+            self.invocationSweepLayer.startPoint = CGPointMake(1.0, 0.22);
+            self.invocationSweepLayer.endPoint   = CGPointMake(0.0, 0.82);
+        } else {
+            self.invocationSweepLayer.startPoint = CGPointMake(0.5, 1.0);
+            self.invocationSweepLayer.endPoint   = CGPointMake(0.5, 0.0);
+        }
+        self.invocationSweepLayer.opacity = 1.0;
+        [CATransaction commit];
+
+        CABasicAnimation *sweepLoc = [CABasicAnimation animationWithKeyPath:@"locations"];
+        sweepLoc.fromValue = @[@(-0.45), @(-0.25), @(-0.10), @(0.05), @(0.20)];
+        sweepLoc.toValue   = @[@(0.80), @(0.95), @(1.10), @(1.25), @(1.45)];
+
+        CAKeyframeAnimation *sweepAlpha = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+        sweepAlpha.values   = @[@0.0, @0.95, @0.85, @0.0];
+        sweepAlpha.keyTimes = @[@0.0, @0.22, @0.68, @1.0];
+
+        CAAnimationGroup *sweepGroup = [CAAnimationGroup animation];
+        sweepGroup.animations = @[sweepLoc, sweepAlpha];
+        sweepGroup.duration = 0.72;
+        sweepGroup.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        self.invocationSweepLayer.opacity = 0.0;
+        [self.invocationSweepLayer addAnimation:sweepGroup forKey:@"agIOS26FullScreenSweep"];
+    }
+
+    // 6. 四周彩色边缘流光向心脉冲扩张与果冻回弹 (iOS 26 边缘流光冲刷特效)
+    self.edgeGlowContainer.transform = CGAffineTransformMakeScale(1.038, 1.038);
     self.edgeGlowContainer.alpha = 0.0;
-    self.screenDimBlurView.transform = CGAffineTransformMakeScale(0.972, 0.972);
 
-    self.currentVoiceAmplitude = 0.90;
-    self.targetVoiceAmplitude = 0.72;
+    self.currentVoiceAmplitude = 0.95;
+    self.targetVoiceAmplitude = 0.78;
     [self stepMarqueeAnimationWithPhase:self.wavePhase voiceAmp:self.currentVoiceAmplitude];
 
-    [UIView animateWithDuration:0.58
+    [UIView animateWithDuration:0.62
                           delay:0.0
-         usingSpringWithDamping:0.68
-          initialSpringVelocity:1.15
+         usingSpringWithDamping:0.65
+          initialSpringVelocity:1.20
                         options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
                      animations:^{
         self.edgeGlowContainer.transform = CGAffineTransformIdentity;
         self.edgeGlowContainer.alpha = 1.0;
-        self.screenDimBlurView.transform = CGAffineTransformIdentity;
     } completion:^(BOOL finished) {
         [self setWaveBarsLevel:0.0];
     }];
@@ -3908,33 +4020,31 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         self.overlayWindow = [[GeminiPassthroughWindow alloc] initWithFrame:screenBounds];
     }
 
-    self.overlayWindow.windowLevel = UIWindowLevelAlert + 500;
+    self.overlayWindow.windowLevel = 10000.0;
     self.overlayWindow.backgroundColor = [UIColor clearColor];
     self.overlayWindow.hidden = YES;
     if ([self.overlayWindow respondsToSelector:@selector(_setSecure:)]) {
         [self.overlayWindow _setSecure:YES];
     }
 
-    UIViewController *rootVC = [[UIViewController alloc] init];
+    // 关键修复 1：使用支持 _canShowWhileLocked 的根控制器，防止 iOS 锁屏安全合成器将背景渲染为纯黑
+    AGLockScreenRootViewController *rootVC = [[AGLockScreenRootViewController alloc] init];
     rootVC.view.backgroundColor = [UIColor clearColor];
     self.overlayWindow.rootViewController = rootVC;
 
-    // 1. 全屏背景深空紫晕毛玻璃层（还原参考图上半部分模糊桌面图标与紫色氛围光晕）
+    // 关键修复 2：彻底隐藏全屏深色毛玻璃与暗角黑幕遮罩（alpha=0, hidden=YES），让锁屏壁纸、时间与桌面图标 100% 透出，告别黑底！
     UIBlurEffect *bgBlur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark];
     self.screenDimBlurView = [[UIVisualEffectView alloc] initWithEffect:bgBlur];
     self.screenDimBlurView.frame = screenBounds;
     self.screenDimBlurView.userInteractionEnabled = NO;
-    self.screenDimBlurView.alpha = 0.36;
+    self.screenDimBlurView.alpha = 0.0;
+    self.screenDimBlurView.hidden = YES;
     [rootVC.view addSubview:self.screenDimBlurView];
 
     self.screenVignetteLayer = [CAGradientLayer layer];
     self.screenVignetteLayer.frame = screenBounds;
-    self.screenVignetteLayer.colors = @[
-        (__bridge id)[UIColor colorWithRed:0.16 green:0.06 blue:0.32 alpha:0.45].CGColor,
-        (__bridge id)[UIColor colorWithRed:0.10 green:0.04 blue:0.24 alpha:0.65].CGColor,
-        (__bridge id)[UIColor colorWithRed:0.04 green:0.02 blue:0.12 alpha:0.88].CGColor
-    ];
-    self.screenVignetteLayer.locations = @[@0.0, @0.55, @1.0];
+    self.screenVignetteLayer.opacity = 0.0;
+    self.screenVignetteLayer.hidden = YES;
     [self.screenDimBlurView.contentView.layer addSublayer:self.screenVignetteLayer];
 
     // 2. iOS 27 呼唤 Siri 全屏无断层向内羽化呼吸跑马灯边框 (1:1 复刻实拍图)
@@ -4020,6 +4130,16 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     self.invocationFlareLayer.endPoint = CGPointMake(1.0, 1.0);
     self.invocationFlareLayer.opacity = 0.0;
     [flareContainer addSublayer:self.invocationFlareLayer];
+
+    // (e) iOS 26 唤起瞬间全屏流光扫光层 (Full-Screen Light Sweep)
+    self.invocationSweepLayer = [CAGradientLayer layer];
+    self.invocationSweepLayer.type = kCAGradientLayerAxial;
+    self.invocationSweepLayer.frame = CGRectInset(screenBounds, -screenBounds.size.width * 0.4, -screenBounds.size.height * 0.4);
+    self.invocationSweepLayer.startPoint = CGPointMake(0.0, 0.0);
+    self.invocationSweepLayer.endPoint = CGPointMake(1.0, 1.0);
+    self.invocationSweepLayer.locations = @[@0.0, @0.35, @0.50, @0.65, @1.0];
+    self.invocationSweepLayer.opacity = 0.0;
+    [self.edgeGlowContainer.layer addSublayer:self.invocationSweepLayer];
 
     self.marqueeSweepProgress = 1.0;
     [self applyMarqueeThemeColors:agCurrentVisualTheme()];
@@ -6100,23 +6220,104 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     });
 }
 
-// 合成并播放 220ms 空灵清脆水晶双音和弦 (D5 -> A5 泛音叠置)，代表麦克风已 100% 就绪
+// 生成 iOS 26 Siri (Apple Intelligence) 标志性空灵双音液态琉璃启动音 WAV 数据 (全生命周期只合成 1 次，0 开销)
+static NSData *agGetIOS26SiriInvocationChimeWAVData(void) {
+    static NSData *sChimeWAV = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        uint32_t sampleRate = 48000;
+        double duration = 0.34; // 340ms 饱满双音与空灵混响尾韵
+        uint32_t totalFrames = (uint32_t)(sampleRate * duration);
+        uint32_t dataSize = totalFrames * sizeof(int16_t);
+        uint32_t fileSize = 36 + dataSize;
+
+        NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataSize];
+        [wav appendBytes:"RIFF" length:4];
+        [wav appendBytes:&fileSize length:4];
+        [wav appendBytes:"WAVEfmt " length:8];
+        uint32_t fmtLen = 16; [wav appendBytes:&fmtLen length:4];
+        uint16_t audioFmt = 1; [wav appendBytes:&audioFmt length:2];
+        uint16_t channels = 1; [wav appendBytes:&channels length:2];
+        [wav appendBytes:&sampleRate length:4];
+        uint32_t byteRate = sampleRate * 2; [wav appendBytes:&byteRate length:4];
+        uint16_t blockAlign = 2; [wav appendBytes:&blockAlign length:2];
+        uint16_t bitsPerSample = 16; [wav appendBytes:&bitsPerSample length:2];
+        [wav appendBytes:"data" length:4];
+        [wav appendBytes:&dataSize length:4];
+
+        int16_t *pcm = (int16_t *)malloc(dataSize);
+        if (pcm) {
+            for (uint32_t i = 0; i < totalFrames; i++) {
+                float t = (float)i / (float)sampleRate;
+                float sample = 0.0f;
+
+                // 第一音 (0.00s ~ 0.14s)：iOS 26 Siri 低频暖感共鸣基底 (D4 293.66Hz + D5 587.33Hz + A5 泛音)
+                if (t < 0.14f) {
+                    float env1 = (t < 0.006f) ? (t / 0.006f) : expf(-(t - 0.006f) * 24.0f);
+                    float tone1 = sinf(2.0f * (float)M_PI * 293.66f * t) * 0.32f
+                                + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f
+                                + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.16f;
+                    sample += tone1 * env1;
+                }
+
+                // 第二音 (0.070s ~ 0.34s)：上行五度空灵绽放和弦 (A5 880Hz + 大三度 C#6 1318.5Hz + 晶莹八度 A6 1760Hz)
+                if (t >= 0.070f) {
+                    float t2 = t - 0.070f;
+                    float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.5f);
+                    float tone2 = sinf(2.0f * (float)M_PI * 440.00f * t2) * 0.22f
+                                + sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.50f
+                                + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.18f
+                                + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.10f;
+                    sample += tone2 * env2;
+                }
+
+                sample *= 0.78f; // 饱满清晰响度，穿透硬件增益爬坡
+                if (sample > 0.98f) sample = 0.98f;
+                else if (sample < -0.98f) sample = -0.98f;
+                pcm[i] = (int16_t)(sample * 32767.0f);
+            }
+            [wav appendBytes:pcm length:dataSize];
+            free(pcm);
+        }
+        sChimeWAV = [wav copy];
+    });
+    return sChimeWAV;
+}
+
 - (void)playCrystalWakeupChimeIfNeeded {
     if (!self.pendingWakeupChime) return;
-    if (self.isDismissed || self.isWarmStandbyMode || !self.overlayWindow || self.overlayWindow.hidden) return;
-    if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
-
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // 防止同一次唤醒重复播放两次
+    if (now - self.lastChimePlayTimestamp < 0.65) {
+        self.pendingWakeupChime = NO;
+        return;
+    }
     self.pendingWakeupChime = NO;
-    // 开启 240ms 麦克风防串音保护窗，防止提示音被录进 wsPreRollPCMBuffer 发给 AI
-    self.chimeMuteUntilTimestamp = [[NSDate date] timeIntervalSince1970] + 0.24;
+    self.lastChimePlayTimestamp = now;
+    // 开启 340ms 麦克风防串音保护窗，防止提示音被录进预录缓冲发给 AI
+    self.chimeMuteUntilTimestamp = now + 0.34;
 
-    dispatch_async(self.audioPlayQueue, ^{
-        if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
+    // 通道 A：立即通过 AVAudioPlayer 播放内存 WAV，确保呼出第 0 秒清脆必响
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            NSData *wavData = agGetIOS26SiriInvocationChimeWAVData();
+            if (wavData.length > 44) {
+                self.wakeupChimePlayer = [[AVAudioPlayer alloc] initWithData:wavData error:nil];
+                self.wakeupChimePlayer.volume = 0.92f;
+                [self.wakeupChimePlayer prepareToPlay];
+                [self.wakeupChimePlayer play];
+            }
+        } @catch (NSException *e) {}
+    });
+
+    // 通道 B：若全双工 VoiceProcessingIO 引擎正在启动/运行，延迟 95ms（避开硬件前 85ms 路由切换吞音期）注入 pcmPlayerNode 双重保障
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.095 * NSEC_PER_SEC)), self.audioPlayQueue, ^{
+        if (self.isDismissed || self.isWarmStandbyMode || !self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
+        if (self.wakeupChimePlayer && self.wakeupChimePlayer.isPlaying) return; // 若通道 A 已正常发声则不叠加
 
         double sampleRate = self.playerOutputFormat.sampleRate > 0 ? self.playerOutputFormat.sampleRate : 48000.0;
         AVAudioChannelCount channels = MAX(1, self.playerOutputFormat.channelCount);
-        double duration = 0.22; // 总长 220ms，短促空灵不拖沓
-        AVAudioFrameCount totalFrames = (AVAudioFrameCount)(sampleRate * duration);
+        AVAudioFrameCount totalFrames = (AVAudioFrameCount)(sampleRate * 0.32);
 
         AVAudioPCMBuffer *chimeBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:self.playerOutputFormat frameCapacity:totalFrames];
         chimeBuf.frameLength = totalFrames;
@@ -6124,42 +6325,22 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         for (AVAudioFrameCount i = 0; i < totalFrames; i++) {
             float t = (float)i / (float)sampleRate;
             float sample = 0.0f;
-
-            // 第一声水晶音 (0.00s ~ 0.10s): D5 (587.33Hz) + 八度泛音 D6 + 五度泛音 A6
-            if (t < 0.11f) {
-                float env1 = (t < 0.004f) ? (t / 0.004f) : expf(-(t - 0.004f) * 30.0f);
-                float tone1 = sinf(2.0f * (float)M_PI * 587.33f * t) * 0.65f
-                            + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.25f
-                            + sinf(2.0f * (float)M_PI * 1760.00f * t) * 0.10f;
-                sample += tone1 * env1;
+            if (t < 0.14f) {
+                float env1 = (t < 0.006f) ? (t / 0.006f) : expf(-(t - 0.006f) * 24.0f);
+                sample += (sinf(2.0f * (float)M_PI * 293.66f * t) * 0.32f + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f) * env1;
             }
-
-            // 第二声水晶和弦 (0.065s ~ 0.22s): A5 (880.0Hz) + 大三度泛音 C#6 + 八度晶莹泛音 A6 (与第一声自然交融产生空灵余韵)
-            if (t >= 0.065f) {
-                float t2 = t - 0.065f;
-                float env2 = (t2 < 0.004f) ? (t2 / 0.004f) : expf(-(t2 - 0.004f) * 19.0f);
-                float tone2 = sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.60f
-                            + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.22f
-                            + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.18f;
-                sample += tone2 * env2;
+            if (t >= 0.070f) {
+                float t2 = t - 0.070f;
+                float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.5f);
+                sample += (sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.52f + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.20f + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.12f) * env2;
             }
-
-            sample *= 0.26f; // 柔和清脆音量，不刺耳、不削波
-            sample = MAX(-1.0f, MIN(1.0f, sample));
-
+            sample = MAX(-0.98f, MIN(0.98f, sample * 0.78f));
             for (AVAudioChannelCount ch = 0; ch < channels; ch++) {
-                if (chimeBuf.floatChannelData[ch]) {
-                    chimeBuf.floatChannelData[ch][i] = sample;
-                }
+                if (chimeBuf.floatChannelData[ch]) chimeBuf.floatChannelData[ch][i] = sample;
             }
         }
-
-        if (!self.liveAudioEngine.isRunning) {
-            [self.liveAudioEngine startAndReturnError:nil];
-        }
-        if (!self.pcmPlayerNode.isPlaying) {
-            [self.pcmPlayerNode play];
-        }
+        if (!self.liveAudioEngine.isRunning) [self.liveAudioEngine startAndReturnError:nil];
+        if (!self.pcmPlayerNode.isPlaying) [self.pcmPlayerNode play];
         [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:nil];
     });
 }
@@ -8321,6 +8502,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
 
 - (void)triggerFromSystemHook {
+    agWakeScreenBacklightIfNeeded();
+    self.pendingWakeupChime = YES;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - self.lastTriggerTime < 0.45) return;
     self.lastTriggerTime = now;
