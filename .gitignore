@@ -4,3 +4,4 @@ packages/
 *.dylib
 *.o
 .DS_Store
+*.backup*

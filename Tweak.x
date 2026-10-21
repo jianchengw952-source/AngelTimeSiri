@@ -33,6 +33,7 @@
 #import <mach/mach_time.h>
 #import <Vision/Vision.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import "AGMultiModelProtocolAdapter.h"
 
 extern char **environ;
 
@@ -1774,6 +1775,19 @@ static dispatch_queue_t agAudioSerialQueue(void) {
 
 static NSString *agExtractTextFromJSON(NSDictionary *dict) {
     if (![dict isKindOfClass:[NSDictionary class]]) return nil;
+    // 1. Anthropic Claude 原生 SSE (content_block_delta) 与非流式响应解析
+    if ([dict[@"type"] isEqualToString:@"content_block_delta"] && [dict[@"delta"] isKindOfClass:[NSDictionary class]]) {
+        NSString *deltaTxt = dict[@"delta"][@"text"];
+        if ([deltaTxt isKindOfClass:[NSString class]] && deltaTxt.length > 0) return deltaTxt;
+    }
+    if ([dict[@"content"] isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *blk in dict[@"content"]) {
+            if ([blk isKindOfClass:[NSDictionary class]] && [blk[@"text"] isKindOfClass:[NSString class]]) {
+                return blk[@"text"];
+            }
+        }
+    }
+    // 2. OpenAI / DeepSeek / Qwen / GLM / 豆包 标准 choices 解析 (保持原样)
     NSArray *choices = dict[@"choices"];
     if ([choices isKindOfClass:[NSArray class]] && choices.count > 0) {
         NSDictionary *firstChoice = choices.firstObject;
@@ -1784,6 +1798,7 @@ static NSString *agExtractTextFromJSON(NSDictionary *dict) {
             }
         }
     }
+    // 3. Google Gemini 原生 candidates 解析 (100% 保持原样)
     NSArray *candidates = dict[@"candidates"];
     if ([candidates isKindOfClass:[NSArray class]] && candidates.count > 0) {
         NSDictionary *cand = candidates.firstObject;
@@ -1840,6 +1855,7 @@ static NSString *agTinyTestWavBase64(void) {
 // 判断是否为仅支持 WebSocket (bidiGenerateContent) 而不支持 HTTP generateContent 的实时模型
 static BOOL agIsPureWebSocketOnlyModel(NSString *modelID, NSDictionary *mDict) {
     NSString *lower = [modelID lowercaseString];
+    if (agIsUnidirectionalAudioModel(lower)) return NO;
     NSArray *methods = mDict[@"supportedGenerationMethods"];
     if ([methods isKindOfClass:[NSArray class]]) {
         BOOL hasBidi = [methods containsObject:@"bidiGenerateContent"];
@@ -1847,16 +1863,13 @@ static BOOL agIsPureWebSocketOnlyModel(NSString *modelID, NSDictionary *mDict) {
         if (hasBidi && !hasHttpGen) return YES;
         if (hasHttpGen) return NO;
     }
-    if ([lower containsString:@"native-audio"] || [lower containsString:@"-live"] || [lower containsString:@"realtime"]) {
-        return YES;
-    }
-    return NO;
+    return agIsBidirectionalRealtimeModelID(modelID, mDict);
 }
 
-// 在「🎙️ 纯正 Live」和「📹 独立视频 AI」下，只要选中的模型支持 WebSocket 实时流，即启动引擎 A（真正的实时语音/视频电话体验）
 static BOOL agIsWebSocketBidiCapableModel(NSString *modelID, AGConfigTab tab) {
     if (!modelID || modelID.length == 0) return NO;
     if (tab == AGConfigTabPureText || tab == AGConfigTabTranslation) return NO;
+    if (agIsUnidirectionalAudioModel([modelID lowercaseString])) return NO;
 
     for (NSDictionary *m in agCachedModelsForTab(tab)) {
         if ([m[@"id"] isEqualToString:modelID]) {
@@ -1864,11 +1877,7 @@ static BOOL agIsWebSocketBidiCapableModel(NSString *modelID, AGConfigTab tab) {
             if (m[@"bidi"] != nil) return [m[@"bidi"] boolValue];
         }
     }
-    NSString *lower = [modelID lowercaseString];
-    if ([lower containsString:@"native-audio"] || [lower containsString:@"-live"] || [lower containsString:@"realtime"] || [lower containsString:@"2.0-flash-exp"]) {
-        return YES;
-    }
-    return NO;
+    return agIsBidirectionalRealtimeModelID(modelID, nil);
 }
 
 // ==================== 2. 提取模型“最新版本号”评分（保障支持且最新的稳定版本排在最前） ====================
@@ -1913,16 +1922,15 @@ static BOOL agIsModelCapableForTab(NSString *mID, NSDictionary *mDict, AGConfigT
     NSString *lower = [mID lowercaseString];
     NSString *shortName = [mID stringByReplacingOccurrencesOfString:@"models/" withString:@""];
 
+    // 过滤嵌入、生图、生视频及单向 ASR/TTS/同传模型
     if ([lower containsString:@"embedding"] || [lower containsString:@"rerank"] ||
         [lower containsString:@"moderation"] || [lower containsString:@"text-embedding"] ||
         [lower containsString:@"aqa"] || [lower containsString:@"bison"] ||
         [lower containsString:@"gecko"] || [lower containsString:@"imagen"] ||
         [lower containsString:@"dall-e"] || [lower containsString:@"veo"] ||
-        [lower containsString:@"sora"] || [lower containsString:@"tts"] ||
-        [lower containsString:@"whisper"] || [lower containsString:@"transcribe"] ||
-        [lower containsString:@"live-translate"] || [lower containsString:@"robotics"] ||
+        [lower containsString:@"sora"] || [lower containsString:@"robotics"] ||
         [lower containsString:@"computer-use"] || [lower containsString:@"learnlm"] ||
-        [lower containsString:@"extended-thinking"]) {
+        [lower containsString:@"extended-thinking"] || agIsUnidirectionalAudioModel(lower)) {
         return NO;
     }
 
@@ -1936,26 +1944,33 @@ static BOOL agIsModelCapableForTab(NSString *mID, NSDictionary *mDict, AGConfigT
     }
 
     BOOL onlyBidi = agIsPureWebSocketOnlyModel(mID, mDict);
-    BOOL isRealtimeBidi = onlyBidi || hasBidi || [lower containsString:@"2.0-flash-exp"] || [lower containsString:@"native-audio"] || [lower containsString:@"-live"] || [lower containsString:@"realtime"];
+    BOOL isRealtimeBidi = onlyBidi || hasBidi || agIsBidirectionalRealtimeModelID(mID, mDict);
     if (outSupportsBidi) *outSupportsBidi = isRealtimeBidi;
 
-    // 1. 在「🎙️ 纯正 Live」和「📹 独立视频 AI」下，优先只保留支持 WebSocket 实时双向通话 (bidiGenerateContent) 的模型，彻底告别单轮问答！
     if (tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI) {
-        if (!isRealtimeBidi) {
-            return NO;
+        if (isRealtimeBidi) {
+            NSString *tag = (tab == AGConfigTabVideoAI) ? @"📹📞[实时视频通话]" : @"🎙️📞[实时语音通话]";
+            if (outBadgeTitle) *outBadgeTitle = [NSString stringWithFormat:@"%@ %@", tag, shortName];
+            return YES;
         }
-        NSString *tag = (tab == AGConfigTabVideoAI) ? @"📹📞[实时视频通话]" : @"🎙️📞[实时语音通话]";
+        // 对于非 Google 厂商（如 DeepSeek、Claude、豆包、Kimi 等无原生 Bidi 模型平台），允许在语音/视频模式下使用引擎 B 连续多轮对话
+        if ([lower hasPrefix:@"models/gemini-"]) {
+            return NO; // Google 平台在 Live/Video 下严格只展示原生 Live 模型，保护现有体验
+        }
+        if (tab == AGConfigTabVideoAI && ([lower containsString:@"deepseek"] && ![lower containsString:@"vl"])) {
+            return NO; // 纯文本模型不进入视频视觉列表
+        }
+        NSString *tag = (tab == AGConfigTabVideoAI) ? @"📹🎙️[多轮视觉语音]" : @"🎙️💬[连续多轮语音]";
         if (outBadgeTitle) *outBadgeTitle = [NSString stringWithFormat:@"%@ %@", tag, shortName];
         return YES;
     }
 
-    // 2. 在「💬 纯文本」和「🌐 屏幕翻译」下，只保留支持 HTTP generateContent 的模型
     if (onlyBidi || !hasHttpGen) {
         return NO;
     }
 
     BOOL isThinking = [lower containsString:@"reasoner"] || [lower containsString:@"thinking"] || [lower containsString:@"-r1"] || [lower hasPrefix:@"o1"] || [lower hasPrefix:@"o3"] || [lower hasPrefix:@"o4"] || [lower containsString:@"qwq"];
-    BOOL isFastLite = [lower containsString:@"flash"] || [lower containsString:@"mini"] || [lower containsString:@"lite"] || [lower containsString:@"turbo"];
+    BOOL isFastLite = [lower containsString:@"flash"] || [lower containsString:@"mini"] || [lower containsString:@"lite"] || [lower containsString:@"turbo"] || [lower containsString:@"haiku"];
 
     NSString *funcTag = isThinking ? @"🧠[深度思考/文本]" : (isFastLite ? @"⚡🌐[高速文本+翻译]" : @"💬[通用文本对话]");
     if (outBadgeTitle) {
@@ -2116,24 +2131,14 @@ static void agFetchCloudModelsForTab(AGConfigTab tab, NSString *endpoint, NSStri
 
     NSURLSession *session = agCreateSessionWithProxy(proxy, nil, nil);
     BOOL isGoogle = agIsGoogleNativeProtocol(cleanEP, @"");
-    NSString *urlStr = nil;
-    if (isGoogle) {
-        urlStr = [NSString stringWithFormat:@"%@/v1beta/models?pageSize=100&key=%@", cleanEP, cleanKey];
-    } else if ([cleanEP containsString:@"dashscope.aliyuncs.com"]) {
-        urlStr = @"https://dashscope.aliyuncs.com/compatible-mode/v1/models";
-    } else if ([cleanEP containsString:@"open.bigmodel.cn"]) {
-        urlStr = @"https://open.bigmodel.cn/api/paas/v4/models";
-    } else if ([cleanEP hasSuffix:@"/v1"]) {
-        urlStr = [NSString stringWithFormat:@"%@/models", cleanEP];
-    } else if ([cleanEP hasSuffix:@"/v1/chat/completions"]) {
-        urlStr = [cleanEP stringByReplacingOccurrencesOfString:@"/v1/chat/completions" withString:@"/v1/models"];
-    } else {
-        urlStr = [NSString stringWithFormat:@"%@/v1/models", cleanEP];
-    }
-
+    NSString *urlStr = agResolveVendorModelsListEndpoint(cleanEP, cleanKey);
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
     if (!isGoogle) {
         [req setValue:[NSString stringWithFormat:@"Bearer %@", cleanKey] forHTTPHeaderField:@"Authorization"];
+        if (agDetectHTTPProtocolFamily(cleanEP, @"") == AGHTTPProtocolFamilyAnthropic) {
+            [req setValue:cleanKey forHTTPHeaderField:@"x-api-key"];
+            [req setValue:@"2023-06-01" forHTTPHeaderField:@"anthropic-version"];
+        }
     }
     req.HTTPMethod = @"GET";
     req.timeoutInterval = 12.0;
@@ -2178,37 +2183,28 @@ static void agFetchCloudModelsForTab(AGConfigTab tab, NSString *endpoint, NSStri
             }
         }
 
-        // 国内平台防空兜底（当阿里通义千问、智谱、火山豆包、Kimi 未开放通用 models 权限时智能填入官方推荐）
-        if (candidatePool.count == 0) {
-            NSArray *defaults = nil;
-            NSString *epLower = [cleanEP lowercaseString];
-            if ([epLower containsString:@"dashscope"]) {
-                defaults = @[@"qwen-plus", @"qwen-turbo", @"qwen-max", @"qwen2.5-72b-instruct", @"qwen-omni-turbo"];
-            } else if ([epLower containsString:@"bigmodel"]) {
-                defaults = @[@"glm-4-flash", @"glm-4-plus", @"glm-4v-plus", @"glm-4-air"];
-            } else if ([epLower containsString:@"volces"] || [epLower containsString:@"bytedance"]) {
-                defaults = @[@"doubao-pro-32k", @"doubao-lite-32k", @"doubao-vision-pro-32k"];
-            } else if ([epLower containsString:@"moonshot"]) {
-                defaults = @[@"moonshot-v1-8k", @"moonshot-v1-32k", @"moonshot-v1-128k"];
-            } else if ([epLower containsString:@"deepseek"]) {
-                defaults = @[@"deepseek-chat", @"deepseek-reasoner"];
-            }
-            if (defaults.count > 0) {
-                for (NSString *dID in defaults) {
-                    [candidatePool addObject:[@{
-                        @"id": dID,
-                        @"title": dID,
-                        @"bidi": @NO,
-                        @"onlyBidi": @NO,
-                        @"newestScore": @1000,
-                        @"supportTier": @1,
-                        @"latencyMs": @9999,
-                        @"latencyStr": @"⚡ 推荐",
-                        @"isUsable": @YES,
-                        @"verified": @NO
-                    } mutableCopy]];
-                }
-            }
+        // 补充各厂商官方 Realtime / 多模态模型（若 /models 未列出）
+        NSArray<NSDictionary *> *supplements = agVendorSupplementalModels(cleanEP, tab);
+        for (NSDictionary *sup in supplements) {
+            NSString *sID = sup[@"id"];
+            if (!sID || [seen containsObject:sID]) continue;
+            NSString *badgeTitle = nil;
+            BOOL supportsBidi = [sup[@"bidi"] boolValue];
+            if (!agIsModelCapableForTab(sID, nil, tab, &badgeTitle, &supportsBidi)) continue;
+            BOOL onlyBidi = [sup[@"onlyBidi"] boolValue];
+            [seen addObject:sID];
+            [candidatePool addObject:[@{
+                @"id": sID,
+                @"title": badgeTitle ?: sID,
+                @"bidi": @(supportsBidi),
+                @"onlyBidi": @(onlyBidi),
+                @"newestScore": @(agCalculateModelNewestScore(sID, nil)),
+                @"supportTier": @(agTabSupportTier(badgeTitle, onlyBidi, supportsBidi, tab)),
+                @"latencyMs": @9999,
+                @"latencyStr": @"⚡ 官方支持",
+                @"isUsable": @YES,
+                @"verified": @NO
+            } mutableCopy]];
         }
 
         if (candidatePool.count == 0) {
@@ -5152,6 +5148,11 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
                     [self sendJSONDictionaryOverWebSocket:@{
                         @"realtimeInput": @{ @"video": @{ @"mimeType": @"image/jpeg", @"data": b64Img } }
                     }];
+                } else {
+                    NSDictionary *vendorVideoPkt = agBuildVendorVideoFramePacket(agEndpointForTab(self.activeModeTab), self.activeWebSocketModel, b64Img);
+                    if (vendorVideoPkt) {
+                        [self sendJSONDictionaryOverWebSocket:vendorVideoPkt];
+                    }
                 }
             }
         });
@@ -5347,29 +5348,22 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
     self.aiPlaybackEndTime = 0;
     self.subStatusLabel.text = [NSString stringWithFormat:@"📞 正在连接 %@ 实时通话 (%@)...", [self currentVendorBrandName], exactModelID];
 
-    NSString *wsURLStr = nil;
-    NSString *hostBase = [[endpoint stringByReplacingOccurrencesOfString:@"https://" withString:@"wss://"] stringByReplacingOccurrencesOfString:@"http://" withString:@"ws://"];
-    NSString *encodedKey = [apiKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: apiKey;
-
+    NSMutableURLRequest *wsReq = nil;
     if (self.isGoogleBidiProtocol) {
-        wsURLStr = [NSString stringWithFormat:@"%@/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=%@", hostBase, encodedKey];
+        // 100% 保持现有 Gemini WebSocket 地址与连接方式不变
+        NSString *hostBase = [[endpoint stringByReplacingOccurrencesOfString:@"https://" withString:@"wss://"] stringByReplacingOccurrencesOfString:@"http://" withString:@"ws://"];
+        NSString *encodedKey = [apiKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: apiKey;
+        NSString *wsURLStr = [NSString stringWithFormat:@"%@/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=%@", hostBase, encodedKey];
+        NSURL *wsURL = [NSURL URLWithString:wsURLStr];
+        if (wsURL) wsReq = [NSMutableURLRequest requestWithURL:wsURL];
     } else {
-        wsURLStr = [hostBase hasSuffix:@"/v1"]
-            ? [NSString stringWithFormat:@"%@/realtime?model=%@", hostBase, exactModelID]
-            : [NSString stringWithFormat:@"%@/v1/realtime?model=%@", hostBase, exactModelID];
+        // 新增模型：通过独立协议适配器构建 DashScope / 智谱 / 阶跃星辰 / OpenAI 官方 WebSocket 请求
+        wsReq = agBuildVendorWebSocketRequest(endpoint, exactModelID, apiKey);
     }
 
-    // 防崩校验：确保 URL 合法非空，杜绝 webSocketTaskWithRequest 抛出 NSInvalidArgumentException
-    NSURL *wsURL = [NSURL URLWithString:wsURLStr];
-    if (!wsURL) {
+    if (!wsReq || !wsReq.URL) {
         self.subStatusLabel.text = @"⚠️ WebSocket 接口地址格式无效，请检查 Endpoint 设置";
         return;
-    }
-
-    NSMutableURLRequest *wsReq = [NSMutableURLRequest requestWithURL:wsURL];
-    if (!self.isGoogleBidiProtocol) {
-        [wsReq setValue:[NSString stringWithFormat:@"Bearer %@", apiKey] forHTTPHeaderField:@"Authorization"];
-        [wsReq setValue:@"realtime=v1" forHTTPHeaderField:@"OpenAI-Beta"];
     }
 
     if (self.liveWebSocketTask) {
@@ -5443,6 +5437,7 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
     }
 
     if (self.isGoogleBidiProtocol) {
+        // 100% 保持现有 Gemini setup 握手报文不变
         NSMutableDictionary *setupDict = [@{
             @"model": fullModelPath,
             @"generationConfig": @{
@@ -5459,23 +5454,19 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
 
         [self sendJSONDictionaryOverWebSocket:@{ @"setup": setupDict }];
     } else {
-        NSDictionary *sessionUpdate = @{
-            @"type": @"session.update",
-            @"session": @{
-                @"modalities": @[@"text", @"audio"],
-                @"instructions": sysInstruction,
-                @"voice": @"alloy",
-                @"input_audio_format": @"pcm16",
-                @"output_audio_format": @"pcm16",
-                @"turn_detection": @{ @"type": @"server_vad" }
-            }
-        };
+        // 非 Google 模型：根据厂商协议生成带 event_id、对应音频格式、官方音色与 Function Calling 工具的 session.update
+        NSString *endpoint = agEndpointForTab(self.activeModeTab);
+        NSDictionary *sessionUpdate = agBuildVendorSessionUpdatePayload(endpoint,
+                                                                        rawModel,
+                                                                        sysInstruction,
+                                                                        (self.isVideoChatActive || self.activeModeTab == AGConfigTabVideoAI),
+                                                                        self.disableTranscriptionInSetup);
         [self sendJSONDictionaryOverWebSocket:sessionUpdate];
     }
 }
 
 - (void)sendJSONDictionaryOverWebSocket:(NSDictionary *)dict {
-    if (!self.liveWebSocketTask || !dict) return;
+    if (!self.liveWebSocketTask || !self.isWebSocketConnected || self.liveWebSocketTask.state != NSURLSessionTaskStateRunning || !dict) return;
     BOOL isRealtimeMedia = (dict[@"realtimeInput"] != nil && dict[@"realtimeInput"][@"text"] == nil);
     if (isRealtimeMedia && self.inFlightWSMessageCount > 10) {
         agLiveDiagLog(@"WS_BACKPRESSURE_DROP", @"Dropped media frame due to inFlight=%ld", (long)self.inFlightWSMessageCount);
@@ -5546,10 +5537,17 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
                         [strongSelf startWebSocketBidiSessionWithModel:boundModel forTab:strongSelf.activeModeTab];
                         return;
                     }
-                    NSString *fallbackModel = @"models/gemini-2.5-flash-native-audio-preview-09-2025";
-                    strongSelf.activeWebSocketModel = fallbackModel;
-                    agLiveDiagLog(@"WS_FALLBACK", @"Switching to verified Live model: %@", fallbackModel);
-                    [strongSelf startWebSocketBidiSessionWithModel:fallbackModel forTab:strongSelf.activeModeTab];
+                    if (strongSelf.isGoogleBidiProtocol) {
+                        NSString *fallbackModel = @"models/gemini-2.5-flash-native-audio-preview-09-2025";
+                        strongSelf.activeWebSocketModel = fallbackModel;
+                        agLiveDiagLog(@"WS_FALLBACK", @"Switching to verified Live model: %@", fallbackModel);
+                        [strongSelf startWebSocketBidiSessionWithModel:fallbackModel forTab:strongSelf.activeModeTab];
+                    } else {
+                        // 非 Google 厂商：绝不篡改为 Google 模型，无缝降级至引擎 B 连续语音模式以保障对话可用
+                        agLiveDiagLog(@"WS_FALLBACK_ENGINE_B", @"WebSocket unavailable for %@, switching to Engine B continuous voice", boundModel);
+                        [strongSelf stopAllVoiceEngines];
+                        [strongSelf startContinuousVoiceListening];
+                    }
                 } else {
                     [strongSelf stopAllVoiceEngines];
                     strongSelf.subStatusLabel.text = [NSString stringWithFormat:@"❌ 实时通话连接断开 (%@): %@", [boundModel stringByReplacingOccurrencesOfString:@"models/" withString:@""], error.localizedDescription];
@@ -5585,7 +5583,25 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         return;
     }
 
-    if (json[@"setupComplete"] != nil || [json[@"type"] isEqualToString:@"session.created"] || [json[@"type"] isEqualToString:@"session.updated"]) {
+    // 1. Google Gemini setupComplete 或 非 Google 模型的 session.updated 确认完成握手
+    if ([json[@"type"] isEqualToString:@"session.created"]) {
+        agLiveDiagLog(@"WS_SESSION_CREATED", @"Received session.created for %@, waiting for session.updated...", self.activeWebSocketModel);
+        // 兼容部分不回传 session.updated 的中转网关：延迟 0.65 秒兜底解锁音频上推
+        NSUInteger capturedToken = self.sessionGenerationToken;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (capturedToken == self.sessionGenerationToken && self.isWebSocketConnected && !self.isSetupHandshakeCompleted) {
+                self.isSetupHandshakeCompleted = YES;
+                self.wsReconnectCount = 0;
+                agLiveDiagLog(@"WS_SETUP_COMPLETE", @"Handshake completed (timer fallback) for model %@", self.activeWebSocketModel);
+                self.subStatusLabel.text = (self.activeModeTab == AGConfigTabVideoAI)
+                    ? @"📞📹 实时视频通话中 (直接说话，支持随时插话打断)..."
+                    : @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
+            }
+        });
+        return;
+    }
+
+    if (json[@"setupComplete"] != nil || [json[@"type"] isEqualToString:@"session.updated"]) {
         if (!self.isSetupHandshakeCompleted) {
             self.isSetupHandshakeCompleted = YES;
             self.wsReconnectCount = 0;
@@ -5722,25 +5738,96 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         return;
     }
 
+    // 2. 非 Google WebSocket 实时事件解析 (OpenAI / 阿里 Qwen-Omni / 智谱 GLM-Realtime / 阶跃星辰 StepAudio)
     NSString *eventType = json[@"type"];
-    if ([eventType isEqualToString:@"response.audio.delta"] && json[@"delta"]) {
+    if (([eventType isEqualToString:@"response.audio.delta"] || [eventType isEqualToString:@"response.output_audio.delta"]) && json[@"delta"]) {
         NSData *pcm24k = [[NSData alloc] initWithBase64EncodedString:json[@"delta"] options:NSDataBase64DecodingIgnoreUnknownCharacters];
         if (pcm24k.length > 0) [self enqueueAndPlayIncomingPCM24kData:pcm24k];
-    } else if ([eventType isEqualToString:@"response.audio_transcript.delta"] && json[@"delta"]) {
+    } else if (([eventType isEqualToString:@"response.audio_transcript.delta"] ||
+                [eventType isEqualToString:@"response.output_audio_transcript.delta"] ||
+                [eventType isEqualToString:@"response.text.delta"]) && json[@"delta"]) {
+        if (self.isLastTranscriptLineUser) {
+            [[self currentTabTranscript] appendString:@"\n"];
+            self.isLastTranscriptLineUser = NO;
+        }
         [self appendIncomingTextDelta:json[@"delta"]];
+    } else if ([eventType isEqualToString:@"conversation.item.input_audio_transcription.completed"] ||
+               [eventType isEqualToString:@"conversation.item.input_audio_transcription.delta"]) {
+        NSString *userTranscript = json[@"transcript"] ?: json[@"delta"];
+        if ([userTranscript isKindOfClass:[NSString class]] && userTranscript.length > 0) {
+            NSMutableString *curTrans = [self currentTabTranscript];
+            if (!self.isLastTranscriptLineUser) {
+                if (curTrans.length > 0 && ![curTrans hasSuffix:@"\n"]) [curTrans appendString:@"\n\n"];
+                [curTrans appendString:@"🗣️ 您："];
+                self.isLastTranscriptLineUser = YES;
+            }
+            [curTrans appendString:userTranscript];
+            [self.currentVoiceQueryBuffer appendString:userTranscript];
+            self.responseTextView.text = curTrans;
+            [self throttledExpandAndScrollTextViewForce:NO];
+
+            [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(checkDeferredVoiceLocalCommand) object:nil];
+            [self performSelector:@selector(checkDeferredVoiceLocalCommand) withObject:nil afterDelay:0.70];
+        }
+    } else if ([eventType isEqualToString:@"response.function_call_arguments.done"]) {
+        // 原生 Function Calling 工具调用回调执行
+        NSString *fnName = json[@"name"] ?: @"";
+        NSString *callID = json[@"call_id"] ?: @"";
+        NSString *argsStr = json[@"arguments"] ?: @"{}";
+        if ([fnName isEqualToString:@"execute_device_action"] && argsStr.length > 2) {
+            NSDictionary *actDict = [NSJSONSerialization JSONObjectWithData:[argsStr dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            if ([actDict isKindOfClass:[NSDictionary class]]) {
+                [self executeActionDictionary:actDict];
+                if (callID.length > 0) {
+                    [self sendJSONDictionaryOverWebSocket:@{
+                        @"event_id": agGenerateRealtimeEventID(),
+                        @"type": @"conversation.item.create",
+                        @"item": @{
+                            @"type": @"function_call_output",
+                            @"call_id": callID,
+                            @"output": @"{\"status\":\"success\"}"
+                        }
+                    }];
+                    [self sendJSONDictionaryOverWebSocket:@{
+                        @"event_id": agGenerateRealtimeEventID(),
+                        @"type": @"response.create"
+                    }];
+                }
+            }
+        }
     } else if ([eventType isEqualToString:@"input_audio_buffer.speech_started"]) {
+        self.currentTurnPlaybackID++;
+        self.pendingPlayBuffersCount = 0;
         if (self.pcmPlayerNode && self.pcmPlayerNode.isPlaying) {
             [self.pcmPlayerNode stop];
             [self.pcmPlayerNode play];
         }
         self.aiPlaybackEndTime = 0;
+        self.subStatusLabel.text = @"⚡ 已打断 AI，正在倾听您说话...";
     } else if ([eventType isEqualToString:@"response.done"]) {
+        self.isLastTranscriptLineUser = NO;
+        if ([self.accumulatedReplyText containsString:@"[ACTION:"]) {
+            BOOL actionExecuted = NO;
+            [self parseAndExecuteActions:self.accumulatedReplyText executed:&actionExecuted];
+            if (actionExecuted) {
+                [self.accumulatedReplyText setString:@""];
+                [self.pendingSpeechChunk setString:@""];
+            }
+        }
+        NSMutableString *curTrans = [self currentTabTranscript];
+        if (curTrans.length > 0 && ![curTrans hasSuffix:@"\n"]) {
+            [curTrans appendString:@"\n\n"];
+            self.responseTextView.text = curTrans;
+            [self throttledExpandAndScrollTextViewForce:YES];
+        }
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         NSTimeInterval remain = MAX(0.05, self.aiPlaybackEndTime - now);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remain * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             self.aiPlaybackEndTime = 0;
             self.wsBargeInVoiceTicks = 0;
-            self.subStatusLabel.text = @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
+            self.subStatusLabel.text = (self.activeModeTab == AGConfigTabVideoAI)
+                ? @"📞📹 实时视频通话中 (直接说话，支持随时插话打断)..."
+                : @"📞 实时语音通话中 (直接说话，支持随时插话打断)...";
             [self setWaveBarsLevel:0.0];
         });
     }
@@ -5955,7 +6042,10 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
 
         if (!strongSelf.isWebSocketConnected || !strongSelf.isSetupHandshakeCompleted) return;
 
-        double targetRate = strongSelf.isGoogleBidiProtocol ? 16000.0 : 24000.0;
+        // Google Bidi 固定 16kHz；非 Google 模型根据厂商官方协议自动选择 16kHz (阿里 Qwen / 智谱 GLM) 或 24kHz (OpenAI / 阶跃星辰)
+        double targetRate = strongSelf.isGoogleBidiProtocol
+            ? 16000.0
+            : agVendorTargetInputSampleRate(agEndpointForTab(strongSelf.activeModeTab), strongSelf.activeWebSocketModel);
         double ratio = inSampleRate / targetRate;
         NSUInteger outFrames = (NSUInteger)((double)inFrames / ratio);
         if (outFrames == 0) return;
@@ -6016,7 +6106,7 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
                     @"realtimeInput": @{ @"audio": @{ @"mimeType": @"audio/pcm;rate=16000", @"data": b64PCM } }
                 }];
             } else {
-                [strongSelf sendJSONDictionaryOverWebSocket:@{ @"type": @"input_audio_buffer.append", @"audio": b64PCM }];
+                [strongSelf sendJSONDictionaryOverWebSocket:agBuildVendorAudioAppendPacket(b64PCM)];
             }
         }
     });
@@ -8315,7 +8405,7 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     } else {
         NSString *baseEP = agSanitizeEndpoint(endpoint, tab);
-        NSString *urlStr = agSanitizeOpenAIEndpoint(baseEP);
+        NSString *urlStr = agResolveVendorHTTPChatEndpoint(baseEP, modelPath);
         NSURL *reqURL = [NSURL URLWithString:urlStr];
         if (!reqURL) {
             reqURL = [NSURL URLWithString:@"https://api.deepseek.com/v1/chat/completions"];
@@ -8323,50 +8413,92 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
         request = [NSMutableURLRequest requestWithURL:reqURL];
         request.HTTPMethod = @"POST";
         [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        [request setValue:[NSString stringWithFormat:@"Bearer %@", apiKey ?: @""] forHTTPHeaderField:@"Authorization"];
 
-        NSMutableArray *messages = [NSMutableArray array];
-        [messages addObject:@{@"role": @"system", @"content": sysPrompt}];
-        for (NSDictionary *hist in curHist) {
-            [messages addObject:hist];
-        }
+        AGHTTPProtocolFamily httpFamily = agDetectHTTPProtocolFamily(baseEP, modelPath);
+        if (httpFamily == AGHTTPProtocolFamilyAnthropic) {
+            [request setValue:(apiKey ?: @"") forHTTPHeaderField:@"x-api-key"];
+            [request setValue:@"2023-06-01" forHTTPHeaderField:@"anthropic-version"];
 
-        NSMutableArray *multimodalContent = [NSMutableArray array];
-        if (cameraJPEG.length > 0) {
-            NSString *b64Img = [cameraJPEG base64EncodedStringWithOptions:0];
-            [multimodalContent addObject:@{
-                @"type": @"image_url",
-                @"image_url": @{@"url": [NSString stringWithFormat:@"data:image/jpeg;base64,%@", b64Img]}
-            }];
-        }
-        if (audioData.length > 0) {
-            NSString *b64Aud = [audioData base64EncodedStringWithOptions:0];
-            [multimodalContent addObject:@{
-                @"type": @"input_audio",
-                @"input_audio": @{@"data": b64Aud, @"format": @"wav"}
-            }];
-        }
-        [multimodalContent addObject:@{@"type": @"text", @"text": (userText.length > 0 ? userText : @"请回答。")}];
-
-        if (cameraJPEG.length > 0 || audioData.length > 0) {
-            [messages addObject:@{@"role": @"user", @"content": multimodalContent}];
-        } else {
-            [messages addObject:@{@"role": @"user", @"content": (userText.length > 0 ? userText : @"你好")}];
-        }
-
-        NSMutableDictionary *body = [@{
-            @"model": exactModelID,
-            @"messages": messages,
-            @"stream": @YES
-        } mutableCopy];
-
-        if (agIsWebSearchEnabled()) {
-            body[@"enable_search"] = @YES;
-            if ([urlStr containsString:@"bigmodel.cn"]) {
-                body[@"tools"] = @[ @{ @"type": @"web_search", @"web_search": @{ @"enable": @YES, @"search_result": @YES } } ];
+            NSMutableArray *claudeMessages = [NSMutableArray array];
+            for (NSDictionary *hist in curHist) {
+                NSString *r = hist[@"role"];
+                if ([r isEqualToString:@"user"] || [r isEqualToString:@"assistant"]) {
+                    [claudeMessages addObject:@{ @"role": r, @"content": hist[@"content"] ?: @"" }];
+                }
             }
+
+            NSMutableArray *userContent = [NSMutableArray array];
+            if (cameraJPEG.length > 0) {
+                NSString *b64Img = [cameraJPEG base64EncodedStringWithOptions:0];
+                [userContent addObject:@{
+                    @"type": @"image",
+                    @"source": @{
+                        @"type": @"base64",
+                        @"media_type": @"image/jpeg",
+                        @"data": b64Img
+                    }
+                }];
+            }
+            [userContent addObject:@{
+                @"type": @"text",
+                @"text": (userText.length > 0 ? userText : @"请回答。")
+            }];
+            [claudeMessages addObject:@{ @"role": @"user", @"content": userContent }];
+
+            NSMutableDictionary *body = [@{
+                @"model": exactModelID,
+                @"system": sysPrompt,
+                @"messages": claudeMessages,
+                @"max_tokens": @4096,
+                @"stream": @YES
+            } mutableCopy];
+            request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+        } else {
+            [request setValue:[NSString stringWithFormat:@"Bearer %@", apiKey ?: @""] forHTTPHeaderField:@"Authorization"];
+
+            NSMutableArray *messages = [NSMutableArray array];
+            [messages addObject:@{@"role": @"system", @"content": sysPrompt}];
+            for (NSDictionary *hist in curHist) {
+                [messages addObject:hist];
+            }
+
+            NSMutableArray *multimodalContent = [NSMutableArray array];
+            if (cameraJPEG.length > 0) {
+                NSString *b64Img = [cameraJPEG base64EncodedStringWithOptions:0];
+                [multimodalContent addObject:@{
+                    @"type": @"image_url",
+                    @"image_url": @{@"url": [NSString stringWithFormat:@"data:image/jpeg;base64,%@", b64Img]}
+                }];
+            }
+            if (audioData.length > 0) {
+                NSString *b64Aud = [audioData base64EncodedStringWithOptions:0];
+                [multimodalContent addObject:@{
+                    @"type": @"input_audio",
+                    @"input_audio": @{@"data": b64Aud, @"format": @"wav"}
+                }];
+            }
+            [multimodalContent addObject:@{@"type": @"text", @"text": (userText.length > 0 ? userText : @"请回答。")}];
+
+            if (cameraJPEG.length > 0 || audioData.length > 0) {
+                [messages addObject:@{@"role": @"user", @"content": multimodalContent}];
+            } else {
+                [messages addObject:@{@"role": @"user", @"content": (userText.length > 0 ? userText : @"你好")}];
+            }
+
+            NSMutableDictionary *body = [@{
+                @"model": exactModelID,
+                @"messages": messages,
+                @"stream": @YES
+            } mutableCopy];
+
+            if (agIsWebSearchEnabled()) {
+                body[@"enable_search"] = @YES;
+                if ([urlStr containsString:@"bigmodel.cn"]) {
+                    body[@"tools"] = @[ @{ @"type": @"web_search", @"web_search": @{ @"enable": @YES, @"search_result": @YES } } ];
+                }
+            }
+            request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
         }
-        request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     }
 
     if (!isGreeting && userText.length > 0 && !audioData) {
@@ -8404,37 +8536,7 @@ static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *o
 }
 
 - (NSString *)extractTextFromDictionary:(NSDictionary *)dict {
-    if (![dict isKindOfClass:[NSDictionary class]]) return nil;
-    NSArray *choices = dict[@"choices"];
-    if ([choices isKindOfClass:[NSArray class]] && choices.count > 0) {
-        NSDictionary *firstChoice = choices.firstObject;
-        if ([firstChoice isKindOfClass:[NSDictionary class]]) {
-            id contentVal = firstChoice[@"delta"][@"content"] ?: firstChoice[@"message"][@"content"];
-            if ([contentVal isKindOfClass:[NSString class]] && [contentVal length] > 0) {
-                return contentVal;
-            }
-        }
-    }
-    NSArray *candidates = dict[@"candidates"];
-    if ([candidates isKindOfClass:[NSArray class]] && candidates.count > 0) {
-        NSDictionary *cand = candidates.firstObject;
-        NSArray *parts = [cand isKindOfClass:[NSDictionary class]] ? cand[@"content"][@"parts"] : nil;
-        if ([parts isKindOfClass:[NSArray class]] && parts.count > 0) {
-            NSMutableString *joined = [NSMutableString string];
-            for (NSDictionary *partItem in parts) {
-                if (![partItem isKindOfClass:[NSDictionary class]]) continue;
-                if ([partItem[@"thought"] boolValue]) continue;
-                id tVal = partItem[@"text"];
-                if ([tVal isKindOfClass:[NSString class]] && [tVal length] > 0) {
-                    [joined appendString:tVal];
-                }
-            }
-            if (joined.length > 0) return joined;
-            id fallbackVal = parts.firstObject[@"text"];
-            if ([fallbackVal isKindOfClass:[NSString class]]) return fallbackVal;
-        }
-    }
-    return nil;
+    return agExtractTextFromJSON(dict);
 }
 
 - (void)processStreamJSONChunk:(NSString *)jsonStr {
