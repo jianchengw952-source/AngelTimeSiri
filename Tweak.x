@@ -333,6 +333,8 @@ static NSArray<NSDictionary *> *agVerifiedDefaultModelsForTab(AGConfigTab tab) {
 - (BOOL)launchApplicationWithIdentifier:(NSString *)identifier suspended:(BOOL)suspended;
 - (void)_simulateLockButtonPress;
 - (void)_relaunchSpringBoardNow;
+- (void)_wakeScreen:(id)arg1;
+- (void)userEventOccurred;
 @end
 
 @interface SBMediaController : NSObject
@@ -353,6 +355,9 @@ static NSArray<NSDictionary *> *agVerifiedDefaultModelsForTab(AGConfigTab tab) {
 + (instancetype)sharedInstanceIfExists;
 @property (readonly, nonatomic) BOOL isUILocked;
 - (BOOL)lockUIFromSource:(NSInteger)source withOptions:(id)options;
+- (void)wakeScreenAnimated:(BOOL)animated;
+- (void)wakeScreenWithReason:(NSString *)reason;
+- (void)tapToWakeInteractiveControllerDidWakeScreen:(id)arg1;
 @end
 
 @interface SBBacklightController : NSObject
@@ -373,10 +378,11 @@ static NSArray<NSDictionary *> *agVerifiedDefaultModelsForTab(AGConfigTab tab) {
 - (BOOL)_canShowWhileLocked { return YES; }
 @end
 
-// 锁屏/息屏状态下主动点亮屏幕硬件背光，解决“嘿 Siri”或电源键唤醒时屏幕不亮的问题
+// 锁屏/息屏状态下主动点亮屏幕硬件背光并唤醒锁屏壁纸与时钟，解决黑屏唤醒与锁屏黑底问题
 static void agWakeScreenBacklightIfNeeded(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
+            // 1. 点亮硬件屏幕背光
             Class blCls = objc_getClass("SBBacklightController");
             if (blCls) {
                 SBBacklightController *bl = [blCls respondsToSelector:@selector(sharedInstanceIfExists)]
@@ -391,11 +397,31 @@ static void agWakeScreenBacklightIfNeeded(void) {
                     }
                 }
             }
+            // 2. 唤醒 SpringBoard 锁屏视图与壁纸 (CoverSheet / Wallpaper)，防止黑底
+            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+            if ([sb respondsToSelector:@selector(_wakeScreen:)]) {
+                [sb _wakeScreen:nil];
+            } else if ([sb respondsToSelector:@selector(userEventOccurred)]) {
+                [sb userEventOccurred];
+            }
             Class lsmCls = objc_getClass("SBLockScreenManager");
-            if (lsmCls && [lsmCls respondsToSelector:@selector(sharedInstanceIfExists)]) {
-                SBLockScreenManager *lsm = [lsmCls sharedInstanceIfExists];
-                if (lsm && [lsm respondsToSelector:@selector(requestUserAttentionScreenWakeFromSource:reason:)]) {
-                    [lsm requestUserAttentionScreenWakeFromSource:1 reason:@"AngelGuardianSiriWake"];
+            if (lsmCls) {
+                SBLockScreenManager *lsm = [lsmCls respondsToSelector:@selector(sharedInstanceIfExists)]
+                    ? [lsmCls sharedInstanceIfExists]
+                    : ([lsmCls respondsToSelector:@selector(sharedInstance)] ? [lsmCls sharedInstance] : nil);
+                if (lsm) {
+                    if ([lsm respondsToSelector:@selector(wakeScreenAnimated:)]) {
+                        [lsm wakeScreenAnimated:YES];
+                    }
+                    if ([lsm respondsToSelector:@selector(wakeScreenWithReason:)]) {
+                        [lsm wakeScreenWithReason:@"AngelGuardianSiriWake"];
+                    }
+                    if ([lsm respondsToSelector:@selector(tapToWakeInteractiveControllerDidWakeScreen:)]) {
+                        [lsm tapToWakeInteractiveControllerDidWakeScreen:nil];
+                    }
+                    if ([lsm respondsToSelector:@selector(requestUserAttentionScreenWakeFromSource:reason:)]) {
+                        [lsm requestUserAttentionScreenWakeFromSource:1 reason:@"AngelGuardianSiriWake"];
+                    }
                 }
             }
         } @catch (NSException *e) {}
@@ -3811,6 +3837,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     // 5. iOS 26 标志性全屏扫光 (Full-Screen Light Sweep)：
     // 电源键唤醒：从右上电源键斜切扫向全屏左下；嘿 Siri 唤醒：从屏幕底部向上全屏冲刷扫过
     if (self.invocationSweepLayer) {
+        self.invocationSweepLayer.hidden = NO;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         self.invocationSweepLayer.frame = CGRectInset(sb, -sb.size.width * 0.5, -sb.size.height * 0.5);
@@ -3838,6 +3865,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         sweepGroup.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
         self.invocationSweepLayer.opacity = 0.0;
         [self.invocationSweepLayer addAnimation:sweepGroup forKey:@"agIOS26FullScreenSweep"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self.invocationSweepLayer.hidden = YES;
+        });
     }
 
     // 6. 四周彩色边缘流光向心脉冲扩张与果冻回弹 (iOS 26 边缘流光冲刷特效)
@@ -3972,7 +4002,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
     NSInteger len = self.responseTextView.text.length;
     if (len > 0) {
-        [self.responseTextView scrollRangeToVisible:NSMakeRange(len - 1, 1)];
+        [UIView performWithoutAnimation:^{
+            [self.responseTextView scrollRangeToVisible:NSMakeRange(len - 1, 1)];
+        }];
     }
 }
 
@@ -4141,6 +4173,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     self.invocationSweepLayer.endPoint = CGPointMake(1.0, 1.0);
     self.invocationSweepLayer.locations = @[@0.0, @0.35, @0.50, @0.65, @1.0];
     self.invocationSweepLayer.opacity = 0.0;
+    self.invocationSweepLayer.hidden = YES;
     [self.edgeGlowContainer.layer addSublayer:self.invocationSweepLayer];
 
     self.marqueeSweepProgress = 1.0;
@@ -6311,6 +6344,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         }
         if (!self.liveAudioEngine.isRunning) [self.liveAudioEngine startAndReturnError:nil];
         if (!self.pcmPlayerNode.isPlaying) [self.pcmPlayerNode play];
+        self.pcmPlayerNode.volume = 1.0f;
         [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:nil];
         agLiveDiagLog(@"CHIME_PLAYED", @"Played iOS 26 Siri invocation chime on pcmPlayerNode");
     });
@@ -6394,8 +6428,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 self.liveAudioEngine = engine;
                 self.pcmPlayerNode = player;
                 self.playerOutputFormat = mixerFormat;
-                // ✅ 避开硬件爬坡静音期 (100ms 错峰)
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                // ✅ 避开硬件爬坡静音期 (380ms 错峰，避开 VoiceProcessingIO 300~350ms 硬件静音窗)
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     [self playCrystalWakeupChimeIfNeeded];
                 });
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Started FullDuplex Engine (inRate=%.0f, outRate=%.0f, vpErr=%@)", tapFormat.sampleRate, mixerFormat.sampleRate, vpErr.localizedDescription ?: @"none");
