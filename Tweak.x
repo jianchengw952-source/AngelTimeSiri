@@ -248,6 +248,121 @@ static void saveGeminiPrefs(NSDictionary *dict) {
                                          NULL, NULL, YES);
 }
 
+// ==================== 全模型通用持久化记忆中枢 (支持国内外所有 WebSocket & HTTP 模型) ====================
+static NSString *agUniversalMemoryFilePath(void) {
+    NSString *dir = @"/var/jb/var/mobile/Library/Preferences";
+    if (![[NSFileManager defaultManager] isWritableFileAtPath:dir]) {
+        dir = @"/var/mobile/Library/Preferences";
+        if (![[NSFileManager defaultManager] isWritableFileAtPath:dir]) {
+            dir = @"/tmp";
+        }
+    }
+    return [dir stringByAppendingPathComponent:@"ag_universal_ai_memory.json"];
+}
+
+static NSMutableDictionary *agLoadUniversalMemory(void) {
+    static NSMutableDictionary *sMemCache = nil;
+    if (sMemCache) return sMemCache;
+    NSData *data = [NSData dataWithContentsOfFile:agUniversalMemoryFilePath()];
+    if (data.length > 2) {
+        NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+        if ([dict isKindOfClass:[NSDictionary class]]) {
+            sMemCache = [dict mutableCopy];
+            if (![sMemCache[@"facts"] isKindOfClass:[NSMutableArray class]]) {
+                sMemCache[@"facts"] = [NSMutableArray arrayWithArray:(sMemCache[@"facts"] ?: @[])];
+            }
+            if (![sMemCache[@"recentTurns"] isKindOfClass:[NSMutableArray class]]) {
+                sMemCache[@"recentTurns"] = [NSMutableArray arrayWithArray:(sMemCache[@"recentTurns"] ?: @[])];
+            }
+            return sMemCache;
+        }
+    }
+    sMemCache = [@{
+        @"facts": [NSMutableArray array],
+        @"recentTurns": [NSMutableArray array]
+    } mutableCopy];
+    return sMemCache;
+}
+
+static void agSaveUniversalMemory(void) {
+    NSMutableDictionary *mem = agLoadUniversalMemory();
+    NSData *data = [NSJSONSerialization dataWithJSONObject:mem options:0 error:nil];
+    if (data) {
+        [data writeToFile:agUniversalMemoryFilePath() atomically:YES];
+        chmod([agUniversalMemoryFilePath() UTF8String], 0666);
+    }
+}
+
+static void agClearUniversalMemory(void) {
+    NSMutableDictionary *mem = agLoadUniversalMemory();
+    [mem[@"facts"] removeAllObjects];
+    [mem[@"recentTurns"] removeAllObjects];
+    agSaveUniversalMemory();
+}
+
+static void agRecordFactToUniversalMemory(NSString *fact) {
+    NSString *clean = [fact stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (clean.length < 2 || clean.length > 200) return;
+    NSMutableArray *facts = agLoadUniversalMemory()[@"facts"];
+    if (![facts containsObject:clean]) {
+        [facts addObject:clean];
+        while (facts.count > 40) [facts removeObjectAtIndex:0];
+        agSaveUniversalMemory();
+    }
+}
+
+static void agRecordDialogueTurnToUniversalMemory(NSString *userText, NSString *aiText) {
+    NSString *uClean = [userText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *aClean = [aiText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (uClean.length == 0 && aClean.length == 0) return;
+
+    // 若用户在话语中明确要求“记住...”，自动提炼进长期核心记忆
+    if (uClean.length >= 4 && ([uClean containsString:@"记住"] || [uClean containsString:@"我叫"] || [uClean containsString:@"我的名字"] || [uClean containsString:@"以后叫我"] || [uClean containsString:@"我喜欢"])) {
+        agRecordFactToUniversalMemory(uClean);
+    }
+
+    if (uClean.length > 180) uClean = [[uClean substringToIndex:180] stringByAppendingString:@"..."];
+    if (aClean.length > 260) aClean = [[aClean substringToIndex:260] stringByAppendingString:@"..."];
+
+    NSMutableArray *turns = agLoadUniversalMemory()[@"recentTurns"];
+    [turns addObject:@{
+        @"u": uClean ?: @"",
+        @"a": aClean ?: @""
+    }];
+    // 滚动保留最近 16 轮跨模型对话上下文
+    while (turns.count > 16) {
+        [turns removeObjectAtIndex:0];
+    }
+    agSaveUniversalMemory();
+}
+
+static NSString *agBuildUniversalMemoryPromptBlock(void) {
+    NSMutableDictionary *mem = agLoadUniversalMemory();
+    NSArray *facts = mem[@"facts"];
+    NSArray *turns = mem[@"recentTurns"];
+    if (facts.count == 0 && turns.count == 0) return @"";
+
+    NSMutableString *blk = [NSMutableString stringWithString:@"\n【全模型共享记忆库（请结合以下用户长期记忆与近期对话上下文自然回答，无需刻意复述记忆规则）】\n"];
+    if (facts.count > 0) {
+        [blk appendString:@"📌 用户长期记忆与偏好：\n"];
+        for (NSString *f in facts) {
+            [blk appendFormat:@"- %@\n", f];
+        }
+    }
+    if (turns.count > 0) {
+        [blk appendString:@"💬 近期历史对话上下文：\n"];
+        NSUInteger startIdx = (turns.count > 10) ? (turns.count - 10) : 0;
+        for (NSUInteger i = startIdx; i < turns.count; i++) {
+            NSDictionary *t = turns[i];
+            NSString *u = t[@"u"];
+            NSString *a = t[@"a"];
+            if (u.length > 0) [blk appendFormat:@"用户：%@\n", u];
+            if (a.length > 0) [blk appendFormat:@"助手：%@\n", a];
+        }
+    }
+    return blk;
+}
+
 static NSArray<NSDictionary *> *agVerifiedDefaultModelsForTab(AGConfigTab tab) {
     switch (tab) {
         case AGConfigTabNativeLive:
@@ -3156,6 +3271,11 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, assign) NSUInteger rxAudioPacketsCount;
 @property (nonatomic, assign) NSUInteger txVideoFramesCount;
 @property (nonatomic, strong) NSMutableString *currentVoiceQueryBuffer;
+@property (nonatomic, strong) NSMutableString *currentTurnUserText;
+@property (nonatomic, strong) NSMutableString *currentTurnReplyText;
+@property (nonatomic, assign) BOOL hasSentFillerAutoContinueInTurn;
+@property (nonatomic, assign) BOOL disableToolsInSetup;
+- (BOOL)checkAndAutoContinueIfFillerTurnOrSaveMemory;
 @property (nonatomic, strong) NSTimer *wsKeepAlivePingTimer;
 @property (nonatomic, assign) NSTimeInterval lastDismissTimestamp;
 @property (nonatomic, assign) BOOL isWarmStandbyMode;
@@ -3250,6 +3370,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         _sseLineBuffer = [NSMutableString string];
         _accumulatedReplyText = [NSMutableString string];
         _currentVoiceQueryBuffer = [NSMutableString string];
+        _currentTurnUserText = [NSMutableString string];
+        _currentTurnReplyText = [NSMutableString string];
         _currentCapsuleHeight = agComputeDeviceMetrics().defaultCapsuleH;
         _currentKeyboardHeight = 0.0;
         _useFrontCamera = NO;
@@ -5908,8 +6030,18 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         sysInstruction = [sysInstruction stringByAppendingString:@"【实时视讯模式】你同时连接了用户的实时摄像头画面。请结合摄像头实时画面智能回答。"];
     }
 
+    // ✅ 1. 解决“说正在查就不往下说”：明确指令禁止模型先说过渡句就结束 Turn，并开启 Google Search
+    sysInstruction = [sysInstruction stringByAppendingString:
+        @"\n【实时联网与一气呵成回答铁律】当用户让你查询今天的新闻、天气、实时资讯或任何问题时，你必须在当前这一轮回答中直接调用搜索工具并一口气把查到的具体结果完整播报出来！严禁只说一句“好的，正在帮您查/请稍等”就结束本轮回答！\n"
+        @"【长期记忆提取规则】当用户在对话中透露了个人姓名、职业、喜好、重要习惯或明确要求你“记住某事”时，请在回答末尾附带隐藏标记 [MEMORY:{\"fact\":\"要记住的核心事实\"}]。"];
+
+    // ✅ 2. 注入全模型共享记忆库（无论是谷歌 Gemini 还是阿里千问/智谱/OpenAI 等所有模型全部自动获得记忆）
+    NSString *memoryBlock = agBuildUniversalMemoryPromptBlock();
+    if (memoryBlock.length > 0) {
+        sysInstruction = [sysInstruction stringByAppendingString:memoryBlock];
+    }
+
     if (self.isGoogleBidiProtocol) {
-        // 100% 保持现有 Gemini setup 握手报文不变
         NSMutableDictionary *setupDict = [@{
             @"model": fullModelPath,
             @"generationConfig": @{
@@ -5923,10 +6055,12 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             setupDict[@"inputAudioTranscription"] = @{};
             setupDict[@"outputAudioTranscription"] = @{};
         }
+        if (agIsWebSearchEnabled() && !self.disableToolsInSetup) {
+            setupDict[@"tools"] = @[ @{ @"googleSearch": @{} } ];
+        }
 
         [self sendJSONDictionaryOverWebSocket:@{ @"setup": setupDict }];
     } else {
-        // 非 Google 模型：根据厂商协议生成带 event_id、对应音频格式、官方音色与 Function Calling 工具的 session.update
         NSString *endpoint = agEndpointForTab(self.activeModeTab);
         NSDictionary *sessionUpdate = agBuildVendorSessionUpdatePayload(endpoint,
                                                                         rawModel,
@@ -6100,7 +6234,112 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     agLiveDiagLog(@"PREROLL_SENT", @"Flushed 3200B silence lead + %lu bytes of pre-roll audio on setupComplete", (unsigned long)preRoll.length);
 }
 
+// 检查 AI 是否只说了“正在查/稍等”就中断了本轮，若是则自动静默触发继续播报结果；否则将本轮对话写入全模型记忆库
+- (BOOL)checkAndAutoContinueIfFillerTurnOrSaveMemory {
+    NSString *reply = [self.currentTurnReplyText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *userQ = [self.currentTurnUserText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    // 1. 解析并保存 [MEMORY:{"fact":"..."}] 标签
+    if ([reply containsString:@"[MEMORY:"]) {
+        NSRegularExpression *memRe = [NSRegularExpression regularExpressionWithPattern:@"\\[MEMORY:(\\{.*?\\})\\]" options:NSRegularExpressionDotMatchesLineSeparators error:nil];
+        NSArray<NSTextCheckingResult *> *matches = [memRe matchesInString:reply options:0 range:NSMakeRange(0, reply.length)];
+        for (NSTextCheckingResult *m in matches) {
+            if (m.numberOfRanges > 1) {
+                NSString *jStr = [reply substringWithRange:[m rangeAtIndex:1]];
+                NSDictionary *mDict = [NSJSONSerialization JSONObjectWithData:[jStr dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                if ([mDict isKindOfClass:[NSDictionary class]] && [mDict[@"fact"] isKindOfClass:[NSString class]]) {
+                    agRecordFactToUniversalMemory(mDict[@"fact"]);
+                }
+            }
+        }
+        reply = [memRe stringByReplacingMatchesInString:reply options:0 range:NSMakeRange(0, reply.length) withTemplate:@""];
+        NSMutableString *curTrans = [self currentTabTranscript];
+        if ([curTrans containsString:@"[MEMORY:"]) {
+            [curTrans setString:[memRe stringByReplacingMatchesInString:curTrans options:0 range:NSMakeRange(0, curTrans.length) withTemplate:@""]];
+            self.responseTextView.text = curTrans;
+        }
+    }
+
+    // 2. 检测是否为“好的，正在帮您查/稍等”半截过渡句（字数 < 55 且包含过渡词，且尚未自动追问过）
+    BOOL isHoldingFiller = NO;
+    if (!self.hasSentFillerAutoContinueInTurn && reply.length > 0 && reply.length < 55) {
+        NSArray *fillerKeywords = @[@"正在查", @"帮您查", @"帮你查", @"查一下", @"搜索一下", @"正在搜索", @"正在为您", @"请稍等", @"稍等一下", @"我看看", @"帮您看", @"正在检索", @"为您查询"];
+        for (NSString *kw in fillerKeywords) {
+            if ([reply containsString:kw]) {
+                isHoldingFiller = YES;
+                break;
+            }
+        }
+    }
+
+    if (isHoldingFiller) {
+        self.hasSentFillerAutoContinueInTurn = YES;
+        [self.currentTurnReplyText setString:@""];
+        agLiveDiagLog(@"AUTO_CONTINUE_SEARCH", @"Detected filler turn (%@), auto-triggering result continuation!", reply);
+        self.subStatusLabel.text = @"🔍 正在为您实时检索并播报结果...";
+        if (self.isGoogleBidiProtocol) {
+            [self sendJSONDictionaryOverWebSocket:@{
+                @"clientContent": @{
+                    @"turns": @[ @{
+                        @"role": @"user",
+                        @"parts": @[ @{ @"text": @"请直接把刚才查询到的具体结果详细播报出来，不要只说正在查。" } ]
+                    } ],
+                    @"turnComplete": @YES
+                }
+            }];
+        } else {
+            [self sendJSONDictionaryOverWebSocket:@{
+                @"event_id": agGenerateRealtimeEventID(),
+                @"type": @"conversation.item.create",
+                @"item": @{
+                    @"type": @"message",
+                    @"role": @"user",
+                    @"content": @[ @{ @"type": @"input_text", @"text": @"请直接把查询到的具体结果详细说出来。" } ]
+                }
+            }];
+            [self sendJSONDictionaryOverWebSocket:@{
+                @"event_id": agGenerateRealtimeEventID(),
+                @"type": @"response.create"
+            }];
+        }
+        return YES; // 已触发自动续接播报
+    }
+
+    // 3. 正常完成的一轮对话：存入全模型持久化记忆库，并同步到 currentTabHistory
+    if (userQ.length > 0 || reply.length > 0) {
+        agRecordDialogueTurnToUniversalMemory(userQ, reply);
+        NSMutableArray *tabHist = [self currentTabHistory];
+        if (userQ.length > 0) [tabHist addObject:@{ @"role": @"user", @"content": userQ }];
+        if (reply.length > 0) [tabHist addObject:@{ @"role": @"assistant", @"content": reply }];
+        while (tabHist.count > 24) [tabHist removeObjectAtIndex:0];
+    }
+    [self.currentTurnUserText setString:@""];
+    [self.currentTurnReplyText setString:@""];
+    self.hasSentFillerAutoContinueInTurn = NO;
+    return NO;
+}
+
 - (void)handleIncomingWebSocketJSON:(NSDictionary *)json {
+    if (json[@"toolCall"]) {
+        NSArray *fCalls = json[@"toolCall"][@"functionCalls"];
+        if ([fCalls isKindOfClass:[NSArray class]] && fCalls.count > 0) {
+            NSMutableArray *fResponses = [NSMutableArray array];
+            for (NSDictionary *fc in fCalls) {
+                NSString *fcID = fc[@"id"] ?: @"";
+                NSString *fcName = fc[@"name"] ?: @"";
+                [fResponses addObject:@{
+                    @"id": fcID,
+                    @"name": fcName,
+                    @"response": @{ @"result": @"ok, please speak the final answer directly to the user." }
+                }];
+            }
+            [self sendJSONDictionaryOverWebSocket:@{
+                @"toolResponse": @{ @"functionResponses": fResponses }
+            }];
+        }
+        return;
+    }
+
     if (json[@"error"]) {
         NSString *errMsg = json[@"error"][@"message"] ?: @"实时流模型返回错误";
         self.subStatusLabel.text = [NSString stringWithFormat:@"⚠️ %@", errMsg];
@@ -6179,6 +6418,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 }
                 [curTrans appendString:userDelta];
                 [self.currentVoiceQueryBuffer appendString:userDelta];
+                [self.currentTurnUserText appendString:userDelta];
+                self.hasSentFillerAutoContinueInTurn = NO;
                 self.responseTextView.text = curTrans;
                 self.subStatusLabel.text = [NSString stringWithFormat:@"🎙️ 正在听您说：%@", self.currentVoiceQueryBuffer];
                 [self throttledExpandAndScrollTextViewForce:NO];
@@ -6206,6 +6447,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                     [[self currentTabTranscript] appendString:@"\n"];
                     self.isLastTranscriptLineUser = NO;
                 }
+                [self.currentTurnReplyText appendString:aiDelta];
                 [self appendIncomingTextDelta:aiDelta];
             }
         }
@@ -6231,6 +6473,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             }
         }
         if ([serverContent[@"turnComplete"] boolValue]) {
+            if ([self checkAndAutoContinueIfFillerTurnOrSaveMemory]) {
+                return;
+            }
             self.isLastTranscriptLineUser = NO;
             if ([self.accumulatedReplyText containsString:@"[ACTION:"]) {
                 BOOL actionExecuted = NO;
@@ -6279,6 +6524,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             [[self currentTabTranscript] appendString:@"\n"];
             self.isLastTranscriptLineUser = NO;
         }
+        if (json[@"delta"]) [self.currentTurnReplyText appendString:json[@"delta"]];
         [self appendIncomingTextDelta:json[@"delta"]];
     } else if ([eventType isEqualToString:@"conversation.item.input_audio_transcription.completed"] ||
                [eventType isEqualToString:@"conversation.item.input_audio_transcription.delta"]) {
@@ -6292,6 +6538,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             }
             [curTrans appendString:userTranscript];
             [self.currentVoiceQueryBuffer appendString:userTranscript];
+            [self.currentTurnUserText appendString:userTranscript];
+            self.hasSentFillerAutoContinueInTurn = NO;
             self.responseTextView.text = curTrans;
             [self throttledExpandAndScrollTextViewForce:NO];
 
@@ -6334,6 +6582,9 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         self.aiPlaybackEndTime = 0;
         self.subStatusLabel.text = @"⚡ 已打断 AI，正在倾听您说话...";
     } else if ([eventType isEqualToString:@"response.done"]) {
+        if ([self checkAndAutoContinueIfFillerTurnOrSaveMemory]) {
+            return;
+        }
         self.isLastTranscriptLineUser = NO;
         if ([self.accumulatedReplyText containsString:@"[ACTION:"]) {
             BOOL actionExecuted = NO;
@@ -7095,6 +7346,13 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     cleanCmd = [cleanCmd stringByReplacingOccurrencesOfString:@"请你" withString:@""];
     cleanCmd = [cleanCmd stringByReplacingOccurrencesOfString:@"请" withString:@""];
     cleanCmd = [cleanCmd stringByReplacingOccurrencesOfString:@"把" withString:@""];
+
+    if ([cleanCmd isEqualToString:@"清除记忆"] || [cleanCmd isEqualToString:@"清空记忆"] || [cleanCmd isEqualToString:@"忘记所有记忆"]) {
+        agClearUniversalMemory();
+        [[self currentTabHistory] removeAllObjects];
+        [self showActionBanner:@"🧹 已清空全模型共享记忆库"];
+        return YES;
+    }
 
     // 0A. 💬 微信未读消息检查与打开指定聊天窗
     if ([cleanCmd containsString:@"微信"] && ([cleanCmd containsString:@"未读"] || [cleanCmd containsString:@"谁给我发"] || [cleanCmd containsString:@"新消息"])) {
@@ -9760,6 +10018,11 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         sysPrompt = [sysPrompt stringByAppendingFormat:@"\n【实时联网搜索已打通】当前系统准确时间：%@。当用户询问关于实时天气、最新新闻、今日资讯、股票行情、体育比分等内容时，请充分利用最新的联网实时信息进行准确作答，绝不输出过期旧信息。\n", nowStr];
     }
 
+    NSString *memBlock = agBuildUniversalMemoryPromptBlock();
+    if (memBlock.length > 0) {
+        sysPrompt = [sysPrompt stringByAppendingString:memBlock];
+    }
+
     NSMutableArray<NSDictionary *> *curHist = [self currentTabHistory];
     BOOL isGoogle = agIsGoogleNativeProtocol(endpoint, modelPath);
     NSMutableURLRequest *request = nil;
@@ -10149,6 +10412,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     }
 
     if (cleanReply.length > 0) {
+        agRecordDialogueTurnToUniversalMemory(self.lastSentUserText, self.accumulatedReplyText);
         [curTrans appendString:@"\n\n"];
         self.responseTextView.text = curTrans;
         NSMutableArray *curHist = [self currentTabHistory];
