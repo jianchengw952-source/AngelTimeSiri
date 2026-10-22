@@ -382,46 +382,25 @@ static NSArray<NSDictionary *> *agVerifiedDefaultModelsForTab(AGConfigTab tab) {
 static void agWakeScreenBacklightIfNeeded(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            // 1. 点亮硬件屏幕背光
             Class blCls = objc_getClass("SBBacklightController");
-            if (blCls) {
-                SBBacklightController *bl = [blCls respondsToSelector:@selector(sharedInstanceIfExists)]
-                    ? [blCls sharedInstanceIfExists]
-                    : ([blCls respondsToSelector:@selector(sharedInstance)] ? [blCls sharedInstance] : nil);
-                if (bl) {
-                    if ([bl respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) {
-                        [bl turnOnScreenFullyWithBacklightSource:1];
-                    }
-                    if ([bl respondsToSelector:@selector(_undimFromSource:)]) {
-                        [bl _undimFromSource:1];
-                    }
+            SBBacklightController *bl = (blCls && [blCls respondsToSelector:@selector(sharedInstanceIfExists)])
+                ? [blCls sharedInstanceIfExists]
+                : ((blCls && [blCls respondsToSelector:@selector(sharedInstance)]) ? [blCls sharedInstance] : nil);
+            BOOL isScreenCurrentlyOn = (bl && [bl respondsToSelector:@selector(screenIsOn)]) ? [bl screenIsOn] : YES;
+
+            // 若当前处于息屏黑屏状态，直接调用 SpringBoard 原生电源键亮屏，100% 唤醒原装锁屏壁纸与时钟！
+            if (!isScreenCurrentlyOn) {
+                SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+                if ([sb respondsToSelector:@selector(_simulateLockButtonPress)]) {
+                    [sb _simulateLockButtonPress];
                 }
             }
-            // 2. 唤醒 SpringBoard 锁屏视图与壁纸 (CoverSheet / Wallpaper)，防止黑底
-            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
-            if ([sb respondsToSelector:@selector(_wakeScreen:)]) {
-                [sb _wakeScreen:nil];
-            } else if ([sb respondsToSelector:@selector(userEventOccurred)]) {
-                [sb userEventOccurred];
-            }
-            Class lsmCls = objc_getClass("SBLockScreenManager");
-            if (lsmCls) {
-                SBLockScreenManager *lsm = [lsmCls respondsToSelector:@selector(sharedInstanceIfExists)]
-                    ? [lsmCls sharedInstanceIfExists]
-                    : ([lsmCls respondsToSelector:@selector(sharedInstance)] ? [lsmCls sharedInstance] : nil);
-                if (lsm) {
-                    if ([lsm respondsToSelector:@selector(wakeScreenAnimated:)]) {
-                        [lsm wakeScreenAnimated:YES];
-                    }
-                    if ([lsm respondsToSelector:@selector(wakeScreenWithReason:)]) {
-                        [lsm wakeScreenWithReason:@"AngelGuardianSiriWake"];
-                    }
-                    if ([lsm respondsToSelector:@selector(tapToWakeInteractiveControllerDidWakeScreen:)]) {
-                        [lsm tapToWakeInteractiveControllerDidWakeScreen:nil];
-                    }
-                    if ([lsm respondsToSelector:@selector(requestUserAttentionScreenWakeFromSource:reason:)]) {
-                        [lsm requestUserAttentionScreenWakeFromSource:1 reason:@"AngelGuardianSiriWake"];
-                    }
+            if (bl) {
+                if ([bl respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) {
+                    [bl turnOnScreenFullyWithBacklightSource:1];
+                }
+                if ([bl respondsToSelector:@selector(_undimFromSource:)]) {
+                    [bl _undimFromSource:1];
                 }
             }
         } @catch (NSException *e) {}
@@ -10845,6 +10824,14 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 - (BOOL)_canShowWhileLocked {
     return YES;
 }
+- (void)viewDidLoad {
+    %orig;
+    if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
+        self.view.hidden = YES;
+        self.view.alpha = 0.0;
+        self.view.backgroundColor = [UIColor clearColor];
+    }
+}
 - (void)requestSiriPresentation:(id)arg1 withOptions:(id)arg2 {
     if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
         if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
@@ -10871,6 +10858,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
         self.view.hidden = YES;
         self.view.alpha = 0.0;
+        self.view.backgroundColor = [UIColor clearColor];
         if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
             [self dismissSiriViewController:nil withReason:0];
         } else if ([self respondsToSelector:@selector(dismissSiriViewController:)]) {
