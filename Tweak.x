@@ -3279,18 +3279,7 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, strong) NSTimer *wsKeepAlivePingTimer;
 @property (nonatomic, assign) NSTimeInterval lastDismissTimestamp;
 @property (nonatomic, assign) BOOL isWarmStandbyMode;
-@property (nonatomic, assign) BOOL pendingWakeupChime;
-@property (nonatomic, assign) NSTimeInterval chimeMuteUntilTimestamp;
-@property (nonatomic, strong) AVAudioPlayer *wakeupChimePlayer;        // 独立低延迟启动提示音播放器
-@property (nonatomic, assign) NSTimeInterval lastChimePlayTimestamp;   // 防重复触发时间戳
-@property (nonatomic, assign) BOOL isTurnMutedByLocalBargeIn;
-@property (nonatomic, assign) NSTimeInterval bargeInMuteTimestamp;
-@property (nonatomic, assign) BOOL wsUserIsSpeakingInTurn;
-@property (nonatomic, assign) NSTimeInterval wsLastVoiceDetectedTime;
-@property (nonatomic, assign) NSTimeInterval wsLastAudioStreamEndSentTime;
 - (void)startWebSocketKeepAlivePingTimer;
-- (void)executeInstantBargeInCleanup:(NSString *)reason;
-- (void)playCrystalWakeupChimeIfNeeded;
 - (void)suspendVoiceSessionKeepWebSocketAlive;
 - (void)prewarmWebSocketInBackgroundIfNeeded;
 - (void)flushPreRollPCMBufferIfNeeded;
@@ -4079,9 +4068,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     agWakeScreenBacklightIfNeeded();
 
     if (!self.overlayWindow) return;
-    self.pendingWakeupChime = YES;
-    // 2. 立即触发 iOS 26 Siri 启动提示音（零延迟必响）
-    [self playCrystalWakeupChimeIfNeeded];
 
     CGRect sb = [UIScreen mainScreen].bounds;
 
@@ -5762,8 +5748,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     self.lastDismissTimestamp = [[NSDate date] timeIntervalSince1970];
     self.pendingPlayBuffersCount = 0;
     self.aiPlaybackEndTime = 0;
-    self.isTurnMutedByLocalBargeIn = NO;
-    self.wsUserIsSpeakingInTurn = NO;
     [self.meterTimer invalidate];
     self.meterTimer = nil;
     [self setWaveBarsLevel:0.0];
@@ -5877,8 +5861,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     pauseBackgroundMediaPlayback();
     self.isDismissed = NO;
     self.isWarmStandbyMode = NO;
-    self.isTurnMutedByLocalBargeIn = NO;
-    self.wsUserIsSpeakingInTurn = NO;
     self.lastTriggerTime = [[NSDate date] timeIntervalSince1970];
     self.wsReconnectCount = 0;
     self.disableTranscriptionInSetup = NO;
@@ -6411,7 +6393,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     NSDictionary *serverContent = json[@"serverContent"];
     if ([serverContent isKindOfClass:[NSDictionary class]]) {
         if ([serverContent[@"interrupted"] boolValue]) {
-            self.isTurnMutedByLocalBargeIn = NO;
             self.currentTurnPlaybackID++;
             self.pendingPlayBuffersCount = 0;
             if (self.pcmPlayerNode && self.pcmPlayerNode.isPlaying) {
@@ -6496,7 +6477,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             }
         }
         if ([serverContent[@"turnComplete"] boolValue]) {
-            self.isTurnMutedByLocalBargeIn = NO;
             if ([self checkAndAutoContinueIfFillerTurnOrSaveMemory]) {
                 return;
             }
@@ -6637,43 +6617,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     }
 }
 
-// 统一瞬时打断清理器：0毫秒停止AI当前播音并封锁在途旧语音包，防止打断后旧包继续放出声音
-- (void)executeInstantBargeInCleanup:(NSString *)reason {
-    self.currentTurnPlaybackID++;
-    self.pendingPlayBuffersCount = 0;
-    self.aiPlaybackEndTime = 0;
-    self.wsBargeInVoiceTicks = 0;
-    if ([reason hasPrefix:@"LOCAL_VAD"]) {
-        self.isTurnMutedByLocalBargeIn = YES;
-        self.bargeInMuteTimestamp = [[NSDate date] timeIntervalSince1970];
-    } else {
-        self.isTurnMutedByLocalBargeIn = NO;
-    }
-    agLiveDiagLog(@"BARGE_IN_CLEANUP", @"Instant barge-in executed (%@), turnID=%lu", reason, (unsigned long)self.currentTurnPlaybackID);
-
-    dispatch_async(self.audioPlayQueue, ^{
-        if (self.pcmPlayerNode) {
-            [self.pcmPlayerNode stop];
-            if (self.liveAudioEngine && self.liveAudioEngine.isRunning) {
-                [self.pcmPlayerNode play];
-            }
-        }
-    });
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.subStatusLabel.text = @"⚡ 已打断 AI，正在倾听您说话...";
-        [self setWaveBarsLevel:0.25];
-    });
-}
-
 - (void)enqueueAndPlayIncomingPCM24kData:(NSData *)pcm16Data {
     if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
-    if (self.isTurnMutedByLocalBargeIn) {
-        if ([[NSDate date] timeIntervalSince1970] - self.bargeInMuteTimestamp < 1.0) {
-            agLiveDiagLog(@"SRV_AUDIO_DROP", @"Blocked in-flight stale audio packet after local barge-in");
-            return;
-        }
-        self.isTurnMutedByLocalBargeIn = NO;
-    }
     NSUInteger inSampleCount = pcm16Data.length / sizeof(int16_t);
     if (inSampleCount == 0) return;
 
@@ -6757,117 +6702,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     });
 }
 
-// 播放 iOS 26 Siri 空灵液态琉璃双音启动提示音（D4/D5 -> A5/C#6/A6，音量 0.85f 穿透静音模式）
-// 预合成 iOS 26 Siri 空灵双音 WAV 数据并注册非静音 SystemSoundID（全生命周期仅生成 1 次）
-static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
-    static NSData *sWavData = nil;
-    static SystemSoundID sSoundID = 0;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        uint32_t sampleRate = 48000;
-        double duration = 0.32;
-        uint32_t totalFrames = (uint32_t)(sampleRate * duration);
-        uint32_t dataSize = totalFrames * sizeof(int16_t);
-        uint32_t fileSize = 36 + dataSize;
-
-        NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataSize];
-        [wav appendBytes:"RIFF" length:4];
-        [wav appendBytes:&fileSize length:4];
-        [wav appendBytes:"WAVEfmt " length:8];
-        uint32_t fmtLen = 16; [wav appendBytes:&fmtLen length:4];
-        uint16_t audioFmt = 1; [wav appendBytes:&audioFmt length:2];
-        uint16_t channels = 1; [wav appendBytes:&channels length:2];
-        [wav appendBytes:&sampleRate length:4];
-        uint32_t byteRate = sampleRate * 2; [wav appendBytes:&byteRate length:4];
-        uint16_t blockAlign = 2; [wav appendBytes:&blockAlign length:2];
-        uint16_t bitsPerSample = 16; [wav appendBytes:&bitsPerSample length:2];
-        [wav appendBytes:"data" length:4];
-        [wav appendBytes:&dataSize length:4];
-
-        int16_t *pcm = (int16_t *)malloc(dataSize);
-        if (pcm) {
-            for (uint32_t i = 0; i < totalFrames; i++) {
-                float t = (float)i / (float)sampleRate;
-                float sample = 0.0f;
-                // 第一音 (0.00s ~ 0.14s): iOS 26 Siri 低频共鸣基底 D4 (293.66Hz) + D5 (587.33Hz) + D6
-                if (t < 0.14f) {
-                    float env1 = (t < 0.006f) ? (t / 0.006f) : expf(-(t - 0.006f) * 24.0f);
-                    sample += (sinf(2.0f * (float)M_PI * 293.66f * t) * 0.34f
-                             + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f
-                             + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.14f) * env1;
-                }
-                // 第二音 (0.070s ~ 0.32s): 上行五度空灵绽放和弦 A5 (880Hz) + C#6 (1318.5Hz) + A6 (1760Hz)
-                if (t >= 0.070f) {
-                    float t2 = t - 0.070f;
-                    float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.0f);
-                    sample += (sinf(2.0f * (float)M_PI * 440.00f * t2) * 0.22f
-                             + sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.52f
-                             + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.18f
-                             + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.10f) * env2;
-                }
-                sample = MAX(-0.98f, MIN(0.98f, sample * 0.90f));
-                pcm[i] = (int16_t)(sample * 32767.0f);
-            }
-            [wav appendBytes:pcm length:dataSize];
-            free(pcm);
-        }
-        sWavData = [wav copy];
-
-        NSString *wavPath = @"/tmp/ag_ios26_siri_chime_v3.wav";
-        [sWavData writeToFile:wavPath atomically:YES];
-        chmod([wavPath UTF8String], 0666);
-        if (AudioServicesCreateSystemSoundID((__bridge CFURLRef)[NSURL fileURLWithPath:wavPath], &sSoundID) == kAudioServicesNoError && sSoundID != 0) {
-            UInt32 isUISound = 0; // 0 = 强制穿透静音模式
-            AudioServicesSetProperty(kAudioServicesPropertyIsUISound, sizeof(SystemSoundID), &sSoundID, sizeof(UInt32), &isUISound);
-        }
-    });
-    if (outSoundID) *outSoundID = sSoundID;
-    return sWavData;
-}
-
-// 独立播放 iOS 26 Siri 启动提示音（彻底解耦，不因 liveAudioEngine 未就绪而跳过）
-- (void)playCrystalWakeupChimeIfNeeded {
-    if (!self.pendingWakeupChime || self.isDismissed) return;
-
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - self.lastChimePlayTimestamp < 0.55) {
-        self.pendingWakeupChime = NO;
-        return;
-    }
-    self.pendingWakeupChime = NO;
-    self.lastChimePlayTimestamp = now;
-
-    void (^fireChimeBlock)(void) = ^{
-        if (self.isDismissed) return;
-        @try {
-            SystemSoundID sid = 0;
-            NSData *wavData = agGetIOS26SiriChimeWAVAndSoundID(&sid);
-            if (sid != 0) {
-                AudioServicesPlaySystemSound(sid);
-            }
-            if (wavData.length > 44) {
-                self.wakeupChimePlayer = [[AVAudioPlayer alloc] initWithData:wavData error:nil];
-                self.wakeupChimePlayer.volume = 1.0f;
-                [self.wakeupChimePlayer prepareToPlay];
-                [self.wakeupChimePlayer play];
-            }
-            agLiveDiagLog(@"CHIME_PLAYED", @"Played iOS 26 Siri chime via SystemSound(%u) + AVAudioPlayer", (unsigned int)sid);
-        } @catch (NSException *e) {}
-    };
-
-    // 若音频引擎已运行或处于纯文本模式，立即播放；若正在切换 PlayAndRecord 路由，则在第 0.02s 与路由稳定后的第 0.28s 双重保障发声
-    if ((self.liveAudioEngine && self.liveAudioEngine.isRunning) || self.activeModeTab == AGConfigTabPureText) {
-        dispatch_async(dispatch_get_main_queue(), fireChimeBlock);
-    } else {
-        dispatch_async(dispatch_get_main_queue(), fireChimeBlock);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.28 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (!self.isDismissed && (!self.wakeupChimePlayer || !self.wakeupChimePlayer.isPlaying)) {
-                fireChimeBlock();
-            }
-        });
-    }
-}
-
 - (void)setupAndStartFullDuplexPCMAudioEngine {
     NSUInteger expectedToken = self.sessionGenerationToken;
     dispatch_async(agAudioSerialQueue(), ^{
@@ -6878,7 +6712,6 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
                 if (!self.pcmPlayerNode.isPlaying) {
                     [self.pcmPlayerNode play];
                 }
-                [self playCrystalWakeupChimeIfNeeded]; // ✅ 复用就绪时立刻播放水晶音
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Reusing active FullDuplex Engine (rate=%.0f)", self.playerOutputFormat.sampleRate);
                 return;
             }
@@ -6946,10 +6779,6 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
                 self.liveAudioEngine = engine;
                 self.pcmPlayerNode = player;
                 self.playerOutputFormat = mixerFormat;
-                // ✅ 避开硬件爬坡静音期 (380ms 错峰，避开 VoiceProcessingIO 300~350ms 硬件静音窗)
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [self playCrystalWakeupChimeIfNeeded];
-                });
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Started FullDuplex Engine (inRate=%.0f, outRate=%.0f, vpErr=%@)", tapFormat.sampleRate, mixerFormat.sampleRate, vpErr.localizedDescription ?: @"none");
             } else {
                 agLiveDiagLog(@"AUDIO_ERR", @"AVAudioEngine start error: %@", startErr.localizedDescription);
@@ -7026,50 +6855,39 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
             return;
         }
 
-        // 1. 恢复最灵敏版本的双阶 VAD 瞬时打断检测（强人声 1 帧 ~20ms 即断，自然人声 2 帧 ~40ms 即断，气口递减不归零）
+        // 打断检测：开启硬件 AEC 后，当 AI 正在播放且检测到清晰人声 (db > -26.0f && peakDb > -15.0f 连续 3 帧 ~65ms)
         if (isAIPlaying) {
-            BOOL isStrongVoice = (db > -22.5f && peakDb > -11.5f);
-            BOOL isNormalVoice = (db > -30.5f && peakDb > -18.5f);
-            if (isStrongVoice) {
-                strongSelf.wsBargeInVoiceTicks += 2;
-            } else if (isNormalVoice) {
-                strongSelf.wsBargeInVoiceTicks += 1;
-            } else {
-                strongSelf.wsBargeInVoiceTicks = MAX(0, strongSelf.wsBargeInVoiceTicks - 1);
-            }
-
-            if (strongSelf.wsBargeInVoiceTicks >= 2) {
-                strongSelf.wsUserIsSpeakingInTurn = YES;
-                strongSelf.wsLastVoiceDetectedTime = now;
-                [strongSelf executeInstantBargeInCleanup:[NSString stringWithFormat:@"LOCAL_VAD(db=%.1f,peak=%.1f)", db, peakDb]];
-                if (!strongSelf.isGoogleBidiProtocol) {
-                    [strongSelf sendJSONDictionaryOverWebSocket:@{ @"type": @"response.cancel" }];
+            if (db > -26.0f && peakDb > -15.0f) {
+                strongSelf.wsBargeInVoiceTicks++;
+                if (strongSelf.wsBargeInVoiceTicks >= 3) {
+                    strongSelf.wsBargeInVoiceTicks = 0;
+                    strongSelf.currentTurnPlaybackID++;
+                    strongSelf.pendingPlayBuffersCount = 0;
+                    strongSelf.aiPlaybackEndTime = 0;
+                    agLiveDiagLog(@"BARGE_IN_LOCAL", @"User barge-in detected (db=%.1f, peak=%.1f), clearing local playback queue", db, peakDb);
+                    dispatch_async(strongSelf.audioPlayQueue, ^{
+                        if (strongSelf.pcmPlayerNode && strongSelf.pcmPlayerNode.isPlaying) {
+                            [strongSelf.pcmPlayerNode stop];
+                            [strongSelf.pcmPlayerNode play];
+                        }
+                    });
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        strongSelf.subStatusLabel.text = @"⚡ 已打断 AI，正在倾听您说话...";
+                    });
+                    if (!strongSelf.isGoogleBidiProtocol) {
+                        [strongSelf sendJSONDictionaryOverWebSocket:@{ @"type": @"response.cancel" }];
+                    }
                 }
+            } else {
+                strongSelf.wsBargeInVoiceTicks = 0;
             }
         } else {
             strongSelf.wsBargeInVoiceTicks = 0;
-            // 2. 恢复最灵敏版本的 0.6s 静音自动发送 audioStreamEnd 机制，话音刚落 0.6s 云端立即秒回！
-            if (db > -38.5f && peakDb > -25.0f) {
-                strongSelf.wsUserIsSpeakingInTurn = YES;
-                strongSelf.wsLastVoiceDetectedTime = now;
-            } else if (strongSelf.wsUserIsSpeakingInTurn && (now - strongSelf.wsLastVoiceDetectedTime >= 0.60)) {
-                strongSelf.wsUserIsSpeakingInTurn = NO;
-                if (now - strongSelf.wsLastAudioStreamEndSentTime >= 1.0) {
-                    strongSelf.wsLastAudioStreamEndSentTime = now;
-                    agLiveDiagLog(@"AUDIO_STREAM_END", @"User silence 0.6s detected, sending audioStreamEnd");
-                    if (strongSelf.isGoogleBidiProtocol) {
-                        [strongSelf sendJSONDictionaryOverWebSocket:@{
-                            @"realtimeInput": @{ @"audioStreamEnd": @YES }
-                        }];
-                    }
-                }
-            }
         }
 
-        // 3. 发送实时 PCM 语音包（打断瞬间降低发包门槛至 640B 立即冲刷上送，平时每 1600B=50ms 发送一包）
+        // 持续向 Gemini Live 推送 16kHz PCM 流（每 1600 字节 = 50ms 发送一包，使用标准 audio 字段代替废弃的 mediaChunks）
         [strongSelf.outgoingPCMBuffer appendData:pcm16Chunk];
-        NSUInteger flushThreshold = (isAIPlaying && db > -30.5f) ? 640 : 1600;
-        if (strongSelf.outgoingPCMBuffer.length >= flushThreshold) {
+        if (strongSelf.outgoingPCMBuffer.length >= 1600) {
             NSData *packet = [strongSelf.outgoingPCMBuffer copy];
             [strongSelf.outgoingPCMBuffer setLength:0];
             NSString *b64PCM = [packet base64EncodedStringWithOptions:0];
@@ -9829,7 +9647,6 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
 
 - (void)triggerFromSystemHook {
     agWakeScreenBacklightIfNeeded();
-    self.pendingWakeupChime = YES;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - self.lastTriggerTime < 0.45) return;
     self.lastTriggerTime = now;
