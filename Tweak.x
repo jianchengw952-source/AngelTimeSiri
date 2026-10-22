@@ -3259,6 +3259,7 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 - (void)dismissOverlay;
 - (void)applyCurrentVisualTheme;
 @property (nonatomic, assign) NSInteger wsBargeInVoiceTicks; // WebSocket 连续人声打断帧计数
+@property (nonatomic, assign) BOOL isLocalBargeInMuted; // 本地打断后拒收在途旧语音包锁
 @property (nonatomic, assign) BOOL isLastTranscriptLineUser; // 标记当前最后一行是否为正在实时弹出的用户语音字幕
 @property (nonatomic, copy) NSString *activeWebSocketModel;
 @property (nonatomic, assign) BOOL disableTranscriptionInSetup;
@@ -4065,9 +4066,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     agWakeScreenBacklightIfNeeded();
 
     if (!self.overlayWindow) return;
-    self.pendingWakeupChime = YES;
-    // 2. 立即触发 iOS 26 Siri 启动提示音（零延迟必响）
-    [self playCrystalWakeupChimeIfNeeded];
+    // self.pendingWakeupChime = YES;
+    // [self playCrystalWakeupChimeIfNeeded];
 
     CGRect sb = [UIScreen mainScreen].bounds;
 
@@ -5691,88 +5691,12 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
 // 亮屏/后台静默预连：只建立 WebSocket 与 setup 握手，绝不启动 AVAudioEngine，不影响音量与嘿 Siri
 - (void)prewarmWebSocketInBackgroundIfNeeded {
-    if (![self isTweakEnabled]) return;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    // ✅ 核心修复：只要当前不是已关闭状态 (isDismissed == NO)，或者距离用户唤醒不足 4 秒，绝对禁止触发后台预热！
-    // 彻底杜绝唤醒瞬间 UIApplicationDidBecomeActiveNotification 触发预热把 isWarmStandbyMode 改回 YES 导致麦克风被杀！
-    if (!self.isDismissed || (now - self.lastTriggerTime < 4.0)) {
-        return;
-    }
-    if (self.overlayWindow && !self.overlayWindow.hidden) {
-        return;
-    }
-    if (self.activeModeTab == AGConfigTabPureText || self.activeModeTab == AGConfigTabTranslation) return;
-    if (self.liveWebSocketTask && self.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
-        return; // 已在连接或已在线，绝不重复重建
-    }
-    NSString *model = agModelForTab(self.activeModeTab);
-    NSString *apiKey = agAPIKeyForTab(self.activeModeTab);
-    if (model.length == 0 || apiKey.length < 4) return;
-    if (!agIsWebSocketBidiCapableModel(model, self.activeModeTab)) return;
-
-    self.isWarmStandbyMode = YES;
-    self.lastDismissTimestamp = now;
-    self.activeWebSocketModel = model;
-    agLiveDiagLog(@"WS_PREWARM", @"Pre-warming WebSocket in background for model %@", model);
-    [self startWebSocketBidiSessionWithModel:model forTab:self.activeModeTab];
+    return;
 }
 
 // 关闭窗口时挂起音频硬件归还系统，但保持 WebSocket 24 小时后台智能热备与续杯
 - (void)suspendVoiceSessionKeepWebSocketAlive {
-    self.isWarmStandbyMode = YES;
-    self.lastDismissTimestamp = [[NSDate date] timeIntervalSince1970];
-    self.pendingPlayBuffersCount = 0;
-    self.aiPlaybackEndTime = 0;
-    [self.meterTimer invalidate];
-    self.meterTimer = nil;
-    [self setWaveBarsLevel:0.0];
-
-    AVAudioEngine *eng = self.liveAudioEngine;
-    AVAudioPlayerNode *pl = self.pcmPlayerNode;
-    self.liveAudioEngine = nil;
-    self.pcmPlayerNode = nil;
-
-    // 彻底释放麦克风与 VoiceProcessing，切回 Ambient 模式，100% 不影响手机原本音量与“嘿 Siri”
-    dispatch_async(agAudioSerialQueue(), ^{
-        @try {
-            if (eng) {
-                [eng.inputNode removeTapOnBus:0];
-                if ([eng.inputNode respondsToSelector:@selector(setVoiceProcessingEnabled:error:)]) {
-                    [eng.inputNode setVoiceProcessingEnabled:NO error:nil];
-                }
-                if (pl && pl.isPlaying) [pl stop];
-                if (eng.isRunning) [eng stop];
-            }
-            AVAudioSession *session = [AVAudioSession sharedInstance];
-            [session setCategory:AVAudioSessionCategoryAmbient withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
-            [session setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
-        } @catch (NSException *e) {}
-    });
-
-    [self.wsKeepAlivePingTimer invalidate];
-    __weak typeof(self) weakSelf = self;
-    self.wsKeepAlivePingTimer = [NSTimer scheduledTimerWithTimeInterval:18.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) { [timer invalidate]; return; }
-        if (strongSelf.isWebSocketConnected && strongSelf.liveWebSocketTask && strongSelf.liveWebSocketTask.state == NSURLSessionTaskStateRunning) {
-            [strongSelf.liveWebSocketTask sendPingWithPongReceiveHandler:^(NSError * _Nullable error) {
-                if (error) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        strongSelf.isWebSocketConnected = NO;
-                        strongSelf.isSetupHandshakeCompleted = NO;
-                        // 若当前未锁屏，立即在后台静默续杯重连，保证用户随时呼出 0 秒可用
-                        if (!isDeviceCurrentlyLocked()) {
-                            [strongSelf prewarmWebSocketInBackgroundIfNeeded];
-                        }
-                    });
-                }
-            }];
-        } else if (!isDeviceCurrentlyLocked() && strongSelf.isWarmStandbyMode) {
-            // 服务端 15 分钟到期断开后，亮屏状态下自动静默重连续杯
-            [strongSelf prewarmWebSocketInBackgroundIfNeeded];
-        }
-    }];
-    agLiveDiagLog(@"WS_WARM_STANDBY", @"Suspended audio & keeping WebSocket alive with 18s heartbeat");
+    [self stopAllVoiceEngines];
 }
 
 - (void)stopAllVoiceEngines {
@@ -5856,49 +5780,32 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
 - (void)startAdaptiveVoiceSessionForTab:(AGConfigTab)tab {
     ensureSpringBoardTCCGranted();
+    [self stopAllVoiceEngines];
     pauseBackgroundMediaPlayback();
     self.isDismissed = NO;
     self.isWarmStandbyMode = NO;
+    self.isLocalBargeInMuted = NO;
     self.lastTriggerTime = [[NSDate date] timeIntervalSince1970];
-    [self.wsKeepAlivePingTimer invalidate];
-    self.wsKeepAlivePingTimer = nil;
     self.wsReconnectCount = 0;
     self.disableTranscriptionInSetup = NO;
+    self.disableToolsInSetup = NO;
     self.hasAutoMigratedDeprecatedModel = NO;
+    [self.currentTurnUserText setString:@""];
+    [self.currentTurnReplyText setString:@""];
+    self.hasSentFillerAutoContinueInTurn = NO;
 
-    NSString *curModel = agModelForTab(tab);
-    // ✅ 关键优化：只要后台 WebSocket 任务正在运行（无论是已完成握手，还是刚在后台连接了一半），都直接无缝接管并立即打开麦克风！
-    if ((tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI) &&
-        curModel.length > 0 &&
-        self.liveWebSocketTask &&
-        self.liveWebSocketTask.state == NSURLSessionTaskStateRunning &&
-        [self.activeWebSocketModel isEqualToString:curModel]) {
-        [self setupAndStartFullDuplexPCMAudioEngine];
-        if (self.isSetupHandshakeCompleted) {
-            self.subStatusLabel.text = (tab == AGConfigTabVideoAI)
-                ? @"📞📹 实时视频通话已就绪 (请直接说话)..."
-                : @"📞 实时语音通话已就绪 (请直接说话)...";
-            agLiveDiagLog(@"WS_FAST_REUSE", @"0ms instant reuse of warm WebSocket for %@", curModel);
-        } else {
-            self.subStatusLabel.text = @"🎙️ 请直接开口说话 (0秒预录收音中)...";
-            agLiveDiagLog(@"WS_INFLIGHT_ADOPT", @"Adopted in-flight prewarm WebSocket for %@", curModel);
-        }
-        return;
-    }
-
-    [self stopAllVoiceEngines];
-    self.isDismissed = NO;
-    self.isWarmStandbyMode = NO;
-    // 在发起网络请求前，第 0.00 秒立即启动全双工麦克风引擎进入预录状态，保证用户马上说话 100% 被录下！
+    // ✅ 第 0.00 秒立即启动全双工麦克风进入预录缓冲，一出主界面马上说话 100% 录进 wsPreRollPCMBuffer
     if (tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI) {
-        self.subStatusLabel.text = @"🎙️ 请直接开口说话 (0秒预录收音中)...";
+        self.subStatusLabel.text = @"🎙️ 正在全双工倾听 (请直接开口说话)...";
         [self setupAndStartFullDuplexPCMAudioEngine];
     }
 
     [self ensureCloudModelsLoadedForTab:tab completion:^(NSString *readyModel) {
         if (tab == AGConfigTabNativeLive || tab == AGConfigTabVideoAI || agIsWebSocketBidiCapableModel(readyModel, tab)) {
             NSString *targetModel = readyModel;
-            if (!targetModel || targetModel.length == 0) return;
+            if (!targetModel || targetModel.length == 0) {
+                targetModel = @"models/gemini-2.5-flash-native-audio-preview-09-2025";
+            }
             self.activeWebSocketModel = targetModel;
             [self startWebSocketBidiSessionWithModel:targetModel forTab:tab];
         } else {
@@ -6074,7 +5981,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 - (void)sendJSONDictionaryOverWebSocket:(NSDictionary *)dict {
     if (!self.liveWebSocketTask || !self.isWebSocketConnected || self.liveWebSocketTask.state != NSURLSessionTaskStateRunning || !dict) return;
     BOOL isRealtimeMedia = (dict[@"realtimeInput"] != nil && dict[@"realtimeInput"][@"text"] == nil);
-    if (isRealtimeMedia && self.inFlightWSMessageCount > 10) {
+    if (isRealtimeMedia && self.inFlightWSMessageCount > 64) {
         agLiveDiagLog(@"WS_BACKPRESSURE_DROP", @"Dropped media frame due to inFlight=%ld", (long)self.inFlightWSMessageCount);
         return;
     }
@@ -6218,7 +6125,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         [self sendJSONDictionaryOverWebSocket:agBuildVendorAudioAppendPacket(silenceB64)];
     }
 
-    NSUInteger chunkSz = 3200;
+    NSUInteger chunkSz = 16000;
     for (NSUInteger offset = 0; offset < preRoll.length; offset += chunkSz) {
         NSUInteger thisLen = MIN(chunkSz, preRoll.length - offset);
         NSData *sub = [preRoll subdataWithRange:NSMakeRange(offset, thisLen)];
@@ -6389,6 +6296,8 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     NSDictionary *serverContent = json[@"serverContent"];
     if ([serverContent isKindOfClass:[NSDictionary class]]) {
         if ([serverContent[@"interrupted"] boolValue]) {
+            self.isLocalBargeInMuted = NO;
+            [self.currentTurnReplyText setString:@""];
             self.currentTurnPlaybackID++;
             self.pendingPlayBuffersCount = 0;
             if (self.pcmPlayerNode && self.pcmPlayerNode.isPlaying) {
@@ -6432,6 +6341,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
         NSDictionary *outputTrans = serverContent[@"outputTranscription"];
         if ([outputTrans isKindOfClass:[NSDictionary class]] && [outputTrans[@"text"] isKindOfClass:[NSString class]]) {
+            self.isLocalBargeInMuted = NO;
             [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(checkDeferredVoiceLocalCommand) object:nil];
             if (self.currentVoiceQueryBuffer.length > 0) {
                 NSString *fullVoiceCmd = [self.currentVoiceQueryBuffer copy];
@@ -6473,6 +6383,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             }
         }
         if ([serverContent[@"turnComplete"] boolValue]) {
+            self.isLocalBargeInMuted = NO;
             if ([self checkAndAutoContinueIfFillerTurnOrSaveMemory]) {
                 return;
             }
@@ -6515,6 +6426,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     // 2. 非 Google WebSocket 实时事件解析 (OpenAI / 阿里 Qwen-Omni / 智谱 GLM-Realtime / 阶跃星辰 StepAudio)
     NSString *eventType = json[@"type"];
     if (([eventType isEqualToString:@"response.audio.delta"] || [eventType isEqualToString:@"response.output_audio.delta"]) && json[@"delta"]) {
+        self.isLocalBargeInMuted = NO;
         NSData *pcm24k = [[NSData alloc] initWithBase64EncodedString:json[@"delta"] options:NSDataBase64DecodingIgnoreUnknownCharacters];
         if (pcm24k.length > 0) [self enqueueAndPlayIncomingPCM24kData:pcm24k];
     } else if (([eventType isEqualToString:@"response.audio_transcript.delta"] ||
@@ -6582,6 +6494,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
         self.aiPlaybackEndTime = 0;
         self.subStatusLabel.text = @"⚡ 已打断 AI，正在倾听您说话...";
     } else if ([eventType isEqualToString:@"response.done"]) {
+        self.isLocalBargeInMuted = NO;
         if ([self checkAndAutoContinueIfFillerTurnOrSaveMemory]) {
             return;
         }
@@ -6614,6 +6527,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 }
 
 - (void)enqueueAndPlayIncomingPCM24kData:(NSData *)pcm16Data {
+    if (self.isLocalBargeInMuted) return; // ✅ 本地已打断，直接拒收在途旧音频包
     if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
     NSUInteger inSampleCount = pcm16Data.length / sizeof(int16_t);
     if (inSampleCount == 0) return;
@@ -6624,7 +6538,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
     // 派发到独立音频播放队列进行重采样与入队，彻底解放主线程 UI，杜绝声音滞后或集中爆发播放
     dispatch_async(self.audioPlayQueue, ^{
-        if (capturedTurnID != self.currentTurnPlaybackID || !self.liveAudioEngine || !self.pcmPlayerNode) {
+        if (self.isLocalBargeInMuted || capturedTurnID != self.currentTurnPlaybackID || !self.liveAudioEngine || !self.pcmPlayerNode) {
             agLiveDiagLog(@"SRV_AUDIO_DROP", @"Dropped stale audio packet #%lu from interrupted turn", (unsigned long)pktIdx);
             return;
         }
@@ -6766,7 +6680,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 if (!self.pcmPlayerNode.isPlaying) {
                     [self.pcmPlayerNode play];
                 }
-                [self playCrystalWakeupChimeIfNeeded]; // ✅ 复用就绪时立刻播放水晶音
+                // [self playCrystalWakeupChimeIfNeeded];
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Reusing active FullDuplex Engine (rate=%.0f)", self.playerOutputFormat.sampleRate);
                 return;
             }
@@ -6835,9 +6749,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 self.pcmPlayerNode = player;
                 self.playerOutputFormat = mixerFormat;
                 // ✅ 避开硬件爬坡静音期 (380ms 错峰，避开 VoiceProcessingIO 300~350ms 硬件静音窗)
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [self playCrystalWakeupChimeIfNeeded];
-                });
+                // [self playCrystalWakeupChimeIfNeeded];
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Started FullDuplex Engine (inRate=%.0f, outRate=%.0f, vpErr=%@)", tapFormat.sampleRate, mixerFormat.sampleRate, vpErr.localizedDescription ?: @"none");
             } else {
                 agLiveDiagLog(@"AUDIO_ERR", @"AVAudioEngine start error: %@", startErr.localizedDescription);
@@ -6915,15 +6827,17 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             return;
         }
 
-        // 打断检测：开启硬件 AEC 后，当 AI 正在播放且检测到清晰人声 (db > -26.0f && peakDb > -15.0f 连续 3 帧 ~65ms)
+        // 打断检测：当 AI 正在播放且检测到用户开口说话 (db > -28.5f && peakDb > -16.5f 连续 2 帧 ~40ms 立即打断)
         if (isAIPlaying) {
-            if (db > -26.0f && peakDb > -15.0f) {
+            if (db > -28.5f && peakDb > -16.5f) {
                 strongSelf.wsBargeInVoiceTicks++;
-                if (strongSelf.wsBargeInVoiceTicks >= 3) {
+                if (strongSelf.wsBargeInVoiceTicks >= 2) {
                     strongSelf.wsBargeInVoiceTicks = 0;
+                    strongSelf.isLocalBargeInMuted = YES; // ✅ 立即锁死旧回合残余音频流，防止 10ms 后复播
                     strongSelf.currentTurnPlaybackID++;
                     strongSelf.pendingPlayBuffersCount = 0;
                     strongSelf.aiPlaybackEndTime = 0;
+                    [strongSelf.currentTurnReplyText setString:@""];
                     agLiveDiagLog(@"BARGE_IN_LOCAL", @"User barge-in detected (db=%.1f, peak=%.1f), clearing local playback queue", db, peakDb);
                     dispatch_async(strongSelf.audioPlayQueue, ^{
                         if (strongSelf.pcmPlayerNode && strongSelf.pcmPlayerNode.isPlaying) {
@@ -6939,7 +6853,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                     }
                 }
             } else {
-                strongSelf.wsBargeInVoiceTicks = 0;
+                strongSelf.wsBargeInVoiceTicks = MAX(0, strongSelf.wsBargeInVoiceTicks - 1);
             }
         } else {
             strongSelf.wsBargeInVoiceTicks = 0;
