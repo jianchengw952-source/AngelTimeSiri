@@ -382,23 +382,46 @@ static NSArray<NSDictionary *> *agVerifiedDefaultModelsForTab(AGConfigTab tab) {
 static void agWakeScreenBacklightIfNeeded(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
+            // 1. 点亮硬件屏幕背光
             Class blCls = objc_getClass("SBBacklightController");
-            SBBacklightController *bl = (blCls && [blCls respondsToSelector:@selector(sharedInstance)]) ? [blCls sharedInstance] : nil;
-            BOOL isScreenCurrentlyOn = (bl && [bl respondsToSelector:@selector(screenIsOn)]) ? [bl screenIsOn] : YES;
-
-            // 若当前处于息屏黑屏状态，直接调用 SpringBoard 原生电源键亮屏，100% 唤醒原装锁屏壁纸与时钟！
-            if (!isScreenCurrentlyOn) {
-                SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
-                if ([sb respondsToSelector:@selector(_simulateLockButtonPress)]) {
-                    [sb _simulateLockButtonPress];
+            if (blCls) {
+                SBBacklightController *bl = [blCls respondsToSelector:@selector(sharedInstanceIfExists)]
+                    ? [blCls sharedInstanceIfExists]
+                    : ([blCls respondsToSelector:@selector(sharedInstance)] ? [blCls sharedInstance] : nil);
+                if (bl) {
+                    if ([bl respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) {
+                        [bl turnOnScreenFullyWithBacklightSource:1];
+                    }
+                    if ([bl respondsToSelector:@selector(_undimFromSource:)]) {
+                        [bl _undimFromSource:1];
+                    }
                 }
             }
-            if (bl) {
-                if ([bl respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) {
-                    [bl turnOnScreenFullyWithBacklightSource:1];
-                }
-                if ([bl respondsToSelector:@selector(_undimFromSource:)]) {
-                    [bl _undimFromSource:1];
+            // 2. 唤醒 SpringBoard 锁屏视图与壁纸 (CoverSheet / Wallpaper)，防止黑底
+            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+            if ([sb respondsToSelector:@selector(_wakeScreen:)]) {
+                [sb _wakeScreen:nil];
+            } else if ([sb respondsToSelector:@selector(userEventOccurred)]) {
+                [sb userEventOccurred];
+            }
+            Class lsmCls = objc_getClass("SBLockScreenManager");
+            if (lsmCls) {
+                SBLockScreenManager *lsm = [lsmCls respondsToSelector:@selector(sharedInstanceIfExists)]
+                    ? [lsmCls sharedInstanceIfExists]
+                    : ([lsmCls respondsToSelector:@selector(sharedInstance)] ? [lsmCls sharedInstance] : nil);
+                if (lsm) {
+                    if ([lsm respondsToSelector:@selector(wakeScreenAnimated:)]) {
+                        [lsm wakeScreenAnimated:YES];
+                    }
+                    if ([lsm respondsToSelector:@selector(wakeScreenWithReason:)]) {
+                        [lsm wakeScreenWithReason:@"AngelGuardianSiriWake"];
+                    }
+                    if ([lsm respondsToSelector:@selector(tapToWakeInteractiveControllerDidWakeScreen:)]) {
+                        [lsm tapToWakeInteractiveControllerDidWakeScreen:nil];
+                    }
+                    if ([lsm respondsToSelector:@selector(requestUserAttentionScreenWakeFromSource:reason:)]) {
+                        [lsm requestUserAttentionScreenWakeFromSource:1 reason:@"AngelGuardianSiriWake"];
+                    }
                 }
             }
         } @catch (NSException *e) {}
@@ -3162,7 +3185,6 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, strong) AVAudioPlayer *wakeupChimePlayer;        // 独立低延迟启动提示音播放器
 @property (nonatomic, assign) NSTimeInterval lastChimePlayTimestamp;   // 防重复触发时间戳
 - (void)playCrystalWakeupChimeIfNeeded;
-- (void)handleSearchOnPlatform:(NSString *)platform keyword:(NSString *)keyword;
 - (void)suspendVoiceSessionKeepWebSocketAlive;
 - (void)prewarmWebSocketInBackgroundIfNeeded;
 - (void)flushPreRollPCMBufferIfNeeded;
@@ -3177,6 +3199,7 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 - (void)launchInSituFollowTranslationFromSheet;
 - (void)launchLiveAudioListenTranslationFromSheet;
 - (void)agScreenTranslateButtonTapped;
+- (void)handleSearchOnPlatform:(NSString *)platform keyword:(NSString *)keyword;
 @end
 
 static void agDarwinPrefsChangedCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
@@ -3942,7 +3965,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
 
     if (!self.overlayWindow) return;
     self.pendingWakeupChime = YES;
-    agLiveDiagLog(@"CHIME_DIAG", @"playIOS27SiriInvocationEffectFromPowerButton triggering playCrystalWakeupChimeIfNeeded");
     // 2. 立即触发 iOS 26 Siri 启动提示音（零延迟必响）
     [self playCrystalWakeupChimeIfNeeded];
 
@@ -6446,82 +6468,11 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     });
 }
 
-// 预合成 iOS 26 Siri 空灵双音 WAV 数据并注册系统级非静音 SoundID（全生命周期仅生成 1 次）
-static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
-    static NSData *sWavData = nil;
-    static SystemSoundID sSoundID = 0;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        uint32_t sampleRate = 48000;
-        double duration = 0.32;
-        uint32_t totalFrames = (uint32_t)(sampleRate * duration);
-        uint32_t dataSize = totalFrames * sizeof(int16_t);
-        uint32_t fileSize = 36 + dataSize;
-
-        NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataSize];
-        [wav appendBytes:"RIFF" length:4];
-        [wav appendBytes:&fileSize length:4];
-        [wav appendBytes:"WAVEfmt " length:8];
-        uint32_t fmtLen = 16; [wav appendBytes:&fmtLen length:4];
-        uint16_t audioFmt = 1; [wav appendBytes:&audioFmt length:2];
-        uint16_t channels = 1; [wav appendBytes:&channels length:2];
-        [wav appendBytes:&sampleRate length:4];
-        uint32_t byteRate = sampleRate * 2; [wav appendBytes:&byteRate length:4];
-        uint16_t blockAlign = 2; [wav appendBytes:&blockAlign length:2];
-        uint16_t bitsPerSample = 16; [wav appendBytes:&bitsPerSample length:2];
-        [wav appendBytes:"data" length:4];
-        [wav appendBytes:&dataSize length:4];
-
-        int16_t *pcm = (int16_t *)malloc(dataSize);
-        if (pcm) {
-            for (uint32_t i = 0; i < totalFrames; i++) {
-                float t = (float)i / (float)sampleRate;
-                float sample = 0.0f;
-                // 第一音 (0.00s ~ 0.14s): iOS 26 Siri 低频共鸣基底 D4 (293.66Hz) + D5 (587.33Hz) + D6
-                if (t < 0.14f) {
-                    float env1 = (t < 0.006f) ? (t / 0.006f) : expf(-(t - 0.006f) * 24.0f);
-                    sample += (sinf(2.0f * (float)M_PI * 293.66f * t) * 0.34f
-                             + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f
-                             + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.14f) * env1;
-                }
-                // 第二音 (0.070s ~ 0.32s): 上行五度空灵绽放和弦 A5 (880Hz) + C#6 (1318.5Hz) + A6 (1760Hz)
-                if (t >= 0.070f) {
-                    float t2 = t - 0.070f;
-                    float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.0f);
-                    sample += (sinf(2.0f * (float)M_PI * 440.00f * t2) * 0.22f
-                             + sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.52f
-                             + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.18f
-                             + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.10f) * env2;
-                }
-                sample = MAX(-0.98f, MIN(0.98f, sample * 0.88f));
-                pcm[i] = (int16_t)(sample * 32767.0f);
-            }
-            [wav appendBytes:pcm length:dataSize];
-            free(pcm);
-        }
-        sWavData = [wav copy];
-
-        NSString *wavPath = @"/tmp/ag_ios26_siri_chime.wav";
-        [sWavData writeToFile:wavPath atomically:YES];
-        chmod([wavPath UTF8String], 0666);
-        if (AudioServicesCreateSystemSoundID((__bridge CFURLRef)[NSURL fileURLWithPath:wavPath], &sSoundID) == kAudioServicesNoError && sSoundID != 0) {
-            // 设为 0 表示非普通 UI 音效，强制穿透手机静音键
-            UInt32 isUISound = 0;
-            AudioServicesSetProperty(kAudioServicesPropertyIsUISound, sizeof(SystemSoundID), &sSoundID, sizeof(UInt32), &isUISound);
-        }
-    });
-    if (outSoundID) *outSoundID = sSoundID;
-    return sWavData;
-}
-
-// 播放 iOS 26 Siri 空灵液态琉璃双音启动提示音（独立播放，不依赖且不触碰 liveAudioEngine）
+// 播放 iOS 26 Siri 空灵液态琉璃双音启动提示音（D4/D5 -> A5/C#6/A6，音量 0.85f 穿透静音模式）
 - (void)playCrystalWakeupChimeIfNeeded {
-    if (!self.pendingWakeupChime) {
-        return;
-    }
-    if (self.isDismissed) {
-        return;
-    }
+    if (!self.pendingWakeupChime) return;
+    if (self.isDismissed || !self.overlayWindow || self.overlayWindow.hidden) return;
+    if (!self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - self.lastChimePlayTimestamp < 0.60) {
@@ -6531,28 +6482,47 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
     self.pendingWakeupChime = NO;
     self.lastChimePlayTimestamp = now;
 
-    // 若当前语音引擎尚未启动完成（处于前 250ms 硬件路由切换期），错峰 0.26s 播放以防被硬件切换吞音；若已就绪则立即播放
-    BOOL isEngineAlreadyRunning = (self.liveAudioEngine != nil && self.liveAudioEngine.isRunning) || (self.activeModeTab == AGConfigTabPureText);
-    NSTimeInterval delaySec = isEngineAlreadyRunning ? 0.01 : 0.26;
+    dispatch_async(self.audioPlayQueue, ^{
+        if (self.isDismissed || !self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) return;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (self.isDismissed) return;
-        @try {
-            SystemSoundID sid = 0;
-            NSData *wavData = agGetIOS26SiriChimeWAVAndSoundID(&sid);
-            if (sid != 0) {
-                AudioServicesPlaySystemSound(sid);
+        double sampleRate = self.playerOutputFormat.sampleRate > 0 ? self.playerOutputFormat.sampleRate : 48000.0;
+        AVAudioChannelCount channels = MAX(1, self.playerOutputFormat.channelCount);
+        AVAudioFrameCount totalFrames = (AVAudioFrameCount)(sampleRate * 0.32);
+
+        AVAudioPCMBuffer *chimeBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:self.playerOutputFormat frameCapacity:totalFrames];
+        chimeBuf.frameLength = totalFrames;
+
+        for (AVAudioFrameCount i = 0; i < totalFrames; i++) {
+            float t = (float)i / (float)sampleRate;
+            float sample = 0.0f;
+            // 第一音 (0.00s ~ 0.14s): iOS 26 Siri 低频共鸣基底 D4 (293.66Hz) + D5 (587.33Hz) + D6
+            if (t < 0.14f) {
+                float env1 = (t < 0.006f) ? (t / 0.006f) : expf(-(t - 0.006f) * 24.0f);
+                sample += (sinf(2.0f * (float)M_PI * 293.66f * t) * 0.34f
+                         + sinf(2.0f * (float)M_PI * 587.33f * t) * 0.52f
+                         + sinf(2.0f * (float)M_PI * 1174.66f * t) * 0.14f) * env1;
             }
-            if (wavData.length > 44) {
-                self.wakeupChimePlayer = [[AVAudioPlayer alloc] initWithData:wavData error:nil];
-                self.wakeupChimePlayer.volume = 1.0f;
-                [self.wakeupChimePlayer prepareToPlay];
-                [self.wakeupChimePlayer play];
+            // 第二音 (0.070s ~ 0.32s): 上行五度空灵绽放和弦 A5 (880Hz) + C#6 (1318.5Hz) + A6 (1760Hz)
+            if (t >= 0.070f) {
+                float t2 = t - 0.070f;
+                float env2 = (t2 < 0.006f) ? (t2 / 0.006f) : expf(-(t2 - 0.006f) * 14.0f);
+                sample += (sinf(2.0f * (float)M_PI * 440.00f * t2) * 0.22f
+                         + sinf(2.0f * (float)M_PI * 880.00f * t2) * 0.52f
+                         + sinf(2.0f * (float)M_PI * 1318.51f * t2) * 0.18f
+                         + sinf(2.0f * (float)M_PI * 1760.00f * t2) * 0.10f) * env2;
             }
-            agLiveDiagLog(@"CHIME_PLAYED", @"Played independent iOS 26 Siri chime (delay=%.2fs, sid=%u)", delaySec, (unsigned int)sid);
-        } @catch (NSException *e) {
-            agLiveDiagLog(@"CHIME_ERR", @"Exception playing chime: %@", e.reason);
+            sample = MAX(-0.98f, MIN(0.98f, sample * 0.85f));
+            for (AVAudioChannelCount ch = 0; ch < channels; ch++) {
+                if (chimeBuf.floatChannelData && chimeBuf.floatChannelData[ch]) {
+                    chimeBuf.floatChannelData[ch][i] = sample;
+                }
+            }
         }
+        if (!self.liveAudioEngine.isRunning) [self.liveAudioEngine startAndReturnError:nil];
+        if (!self.pcmPlayerNode.isPlaying) [self.pcmPlayerNode play];
+        self.pcmPlayerNode.volume = 1.0f;
+        [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:nil];
+        agLiveDiagLog(@"CHIME_PLAYED", @"Played iOS 26 Siri invocation chime on pcmPlayerNode");
     });
 }
 
@@ -6566,7 +6536,6 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
                 if (!self.pcmPlayerNode.isPlaying) {
                     [self.pcmPlayerNode play];
                 }
-                agLiveDiagLog(@"CHIME_DIAG", @"setupAndStartFullDuplexPCMAudioEngine (reuse) triggering playCrystalWakeupChimeIfNeeded");
                 [self playCrystalWakeupChimeIfNeeded]; // ✅ 复用就绪时立刻播放水晶音
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Reusing active FullDuplex Engine (rate=%.0f)", self.playerOutputFormat.sampleRate);
                 return;
@@ -6637,7 +6606,6 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
                 self.playerOutputFormat = mixerFormat;
                 // ✅ 避开硬件爬坡静音期 (380ms 错峰，避开 VoiceProcessingIO 300~350ms 硬件静音窗)
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    agLiveDiagLog(@"CHIME_DIAG", @"setupAndStartFullDuplexPCMAudioEngine (delayed 0.38s) triggering playCrystalWakeupChimeIfNeeded");
                     [self playCrystalWakeupChimeIfNeeded];
                 });
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Started FullDuplex Engine (inRate=%.0f, outRate=%.0f, vpErr=%@)", tapFormat.sampleRate, mixerFormat.sampleRate, vpErr.localizedDescription ?: @"none");
@@ -7134,7 +7102,7 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
         timerRe = [NSRegularExpression regularExpressionWithPattern:@"(?:定个|设个|设置|开启|来个)?(\\d{1,3})(?:分钟|分|秒)(?:的)?(?:倒计时|计时器)" options:0 error:nil];
         alarmRe = [NSRegularExpression regularExpressionWithPattern:@"(?:定个|设个|设置|定一个)?(?:明天|明早|早上|上午|下午|晚上)?(\\d{1,2})(?:点|时|:|：)(?:(\\d{1,2})分?)?(?:的)?闹钟" options:0 error:nil];
         tapTextRe = [NSRegularExpression regularExpressionWithPattern:@"(?:点击|点一下)(?:屏幕上的|按钮)?[“\"'「]?([^”\"'」，。！？,.!?\\s]+)[”\"'」]?" options:0 error:nil];
-        searchRegex = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:打开|启动|在|去|用|上)?([^，。！？,.!?\\s\\x22\\x27\\d]{1,10}?)(?:里|上|app|软件|客户端)?)?(?:搜一下|搜索一下|查找一下|找一下|搜索|搜|找|买|看)(?:一下|个|点|部|台|件|张|本)?(.+)$" options:0 error:nil];
+        searchRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:打开|启动|在|去|用|上)?(淘宝|京东|拼多多|美团|抖音|b站|哔哩哔哩|小红书|知乎|微博|百度)(?:里|上|app)?(?:帮我)?(?:搜一下|搜索一下|查找一下|找一下|搜索|搜|找|买|看)(?:一下)?(.+)$" options:0 error:nil];
         naviRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:打开|用|使用)?(?:高德地图|百度地图|苹果地图|高德|百度|地图)?(?:帮我)?(?:导航|驾车|骑行|步行)?(?:到|去|前往|去往)(.+?)(?:怎么走|怎么去|吧|呢)?$" options:0 error:nil];
         musicRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:在网易云|在qq音乐|听|播放)(?:搜|播|听)?([^，。！？,.!?\\s]+)" options:0 error:nil];
         openRegex = [NSRegularExpression regularExpressionWithPattern:@"^(?:打开|启动|开启)([^，。！？,.!?\\s”\"']+)$" options:0 error:nil];
@@ -7656,15 +7624,10 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
             return YES;
         }
     }
-
-    // 🛍️/🎬 三级混合智能体搜索（支持全国所有主流电商、视频、生活、地图与本地应用搜索，带“淘宝搜索手机”、“京东买充电宝”、“小红书搜穿搭”等全套口语）
+    // 🛍️/🎬 各大电商与视频平台搜索（支持“打开淘宝搜索一下手机”、“去京东搜充电宝”、“在拼多多找纸巾”等全套口语）
     NSTextCheckingResult *searchMatch = [searchRegex firstMatchInString:cleanCmd options:0 range:NSMakeRange(0, cleanCmd.length)];
     if (searchMatch && searchMatch.numberOfRanges >= 3) {
-        NSString *pltName = @"baidu";
-        if ([searchMatch rangeAtIndex:1].location != NSNotFound) {
-            NSString *p = [cleanCmd substringWithRange:[searchMatch rangeAtIndex:1]];
-            if (p.length > 0) pltName = p;
-        }
+        NSString *pltName = [cleanCmd substringWithRange:[searchMatch rangeAtIndex:1]];
         NSString *kw = [[cleanCmd substringWithRange:[searchMatch rangeAtIndex:2]] stringByTrimmingCharactersInSet:[NSCharacterSet punctuationCharacterSet]];
         kw = [kw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (kw.length > 0) {
@@ -9508,16 +9471,9 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
 
 - (void)triggerFromSystemHook {
     agWakeScreenBacklightIfNeeded();
-    BOOL willOpen = (self.overlayWindow == nil || self.overlayWindow.hidden || self.overlayWindow.alpha <= 0.1);
-    if (willOpen) {
-        self.pendingWakeupChime = YES;
-    }
-    agLiveDiagLog(@"CHIME_DIAG", @"triggerFromSystemHook called: willOpen=%d, pendingChime=%d", willOpen, self.pendingWakeupChime);
+    self.pendingWakeupChime = YES;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - self.lastTriggerTime < 0.45) {
-        agLiveDiagLog(@"CHIME_DIAG", @"triggerFromSystemHook throttled: dt=%.3f < 0.45", now - self.lastTriggerTime);
-        return;
-    }
+    if (now - self.lastTriggerTime < 0.45) return;
     self.lastTriggerTime = now;
 
     pauseBackgroundMediaPlayback();
@@ -10889,29 +10845,6 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
 - (BOOL)_canShowWhileLocked {
     return YES;
 }
-- (void)viewDidLoad {
-    %orig;
-    if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
-        self.view.hidden = YES;
-        self.view.alpha = 0.0;
-        self.view.backgroundColor = [UIColor clearColor];
-    }
-}
-- (void)viewWillAppear:(BOOL)animated {
-    %orig(animated);
-    if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
-        self.view.hidden = YES;
-        self.view.alpha = 0.0;
-        self.view.backgroundColor = [UIColor clearColor];
-        if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
-            [self dismissSiriViewController:nil withReason:0];
-        } else if ([self respondsToSelector:@selector(dismissSiriViewController:)]) {
-            [self dismissSiriViewController:nil];
-        }
-        agWakeScreenBacklightIfNeeded();
-        [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
-    }
-}
 - (void)requestSiriPresentation:(id)arg1 withOptions:(id)arg2 {
     if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
         if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
@@ -10932,6 +10865,20 @@ static NSData *agGetIOS26SiriChimeWAVAndSoundID(SystemSoundID *outSoundID) {
         return;
     }
     %orig(context);
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig(animated);
+    if ([[GeminiAssistantManager sharedManager] isTweakEnabled]) {
+        self.view.hidden = YES;
+        self.view.alpha = 0.0;
+        if ([self respondsToSelector:@selector(dismissSiriViewController:withReason:)]) {
+            [self dismissSiriViewController:nil withReason:0];
+        } else if ([self respondsToSelector:@selector(dismissSiriViewController:)]) {
+            [self dismissSiriViewController:nil];
+        }
+        agWakeScreenBacklightIfNeeded();
+        [[GeminiAssistantManager sharedManager] triggerFromSystemHook];
+    }
 }
 %end
 // ==============================================================================
