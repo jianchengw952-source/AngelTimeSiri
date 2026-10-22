@@ -3161,6 +3161,8 @@ static void agSimulateScreenSwipe(CGPoint startPt, CGPoint endPt, NSTimeInterval
 @property (nonatomic, assign) NSTimeInterval chimeMuteUntilTimestamp;
 @property (nonatomic, strong) AVAudioPlayer *wakeupChimePlayer;        // 独立低延迟启动提示音播放器
 @property (nonatomic, assign) NSTimeInterval lastChimePlayTimestamp;   // 防重复触发时间戳
+@property (nonatomic, assign) BOOL isPlayingWakeupChime;               // 标记当前是否正在播放启动提示音
+@property (nonatomic, assign) BOOL pendingAudioEngineStartAfterChime;  // 标记提示音播完后是否需要立即启动麦克风引擎
 - (void)playCrystalWakeupChimeIfNeeded;
 - (void)handleSearchOnPlatform:(NSString *)platform keyword:(NSString *)keyword;
 - (void)suspendVoiceSessionKeepWebSocketAlive;
@@ -5547,7 +5549,7 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
             }
         } @catch (NSException *e) {}
         @try {
-            if (rec || eng) {
+            if ((rec || eng) && !self.isPlayingWakeupChime) {
                 AVAudioSession *session = [AVAudioSession sharedInstance];
                 [session setCategory:AVAudioSessionCategoryAmbient withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
                 [session setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
@@ -6271,148 +6273,141 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
     });
 }
 
-// 播放 iOS 27 Siri 全息三阶水晶启动提示音（走 pcmPlayerNode 内部硬件 AEC 通道，不抢麦克风、支持边响边说 + 低音量自动增响 + 全链路 CHIME_DIAG 日志）
-- (void)playCrystalWakeupChimeIfNeeded {
-    if (!self.pendingWakeupChime) {
-        agLiveDiagLog(@"CHIME_DIAG", @"Skipped: pendingWakeupChime is NO");
-        return;
-    }
-    if (self.isDismissed || !self.overlayWindow || self.overlayWindow.hidden) {
-        agLiveDiagLog(@"CHIME_DIAG", @"Skipped: window dismissed or hidden (dismissed=%d, hidden=%d)", self.isDismissed, self.overlayWindow ? self.overlayWindow.hidden : 1);
-        return;
-    }
+// 预合成 iOS 27 Siri 全息三阶晶簇高响度 WAV 数据（全生命周期仅生成 1 次，不注册 SystemSoundID 绝不抢占麦克风）
+static NSData *agGetIOS27SiriChimeWAVData(void) {
+    static NSData *sWavData = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        uint32_t sampleRate = 48000;
+        double duration = 0.28;
+        uint32_t totalFrames = (uint32_t)(sampleRate * duration);
+        uint32_t dataSize = totalFrames * sizeof(int16_t);
+        uint32_t fileSize = 36 + dataSize;
 
-    // 关键：若全双工音频引擎正在后台线程启动中，保留 pendingWakeupChime = YES，等待引擎启动成功瞬间自动触发，绝不提前清空标志位！
-    if (!self.liveAudioEngine || !self.liveAudioEngine.isRunning || !self.pcmPlayerNode || !self.playerOutputFormat) {
-        agLiveDiagLog(@"CHIME_DIAG", @"Deferred: waiting for FullDuplex Engine start (eng=%d, run=%d, player=%d, fmt=%d)",
-                      (self.liveAudioEngine != nil), (self.liveAudioEngine && self.liveAudioEngine.isRunning), (self.pcmPlayerNode != nil), (self.playerOutputFormat != nil));
+        NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataSize];
+        [wav appendBytes:"RIFF" length:4];
+        [wav appendBytes:&fileSize length:4];
+        [wav appendBytes:"WAVEfmt " length:8];
+        uint32_t fmtLen = 16; [wav appendBytes:&fmtLen length:4];
+        uint16_t audioFmt = 1; [wav appendBytes:&audioFmt length:2];
+        uint16_t channels = 1; [wav appendBytes:&channels length:2];
+        [wav appendBytes:&sampleRate length:4];
+        uint32_t byteRate = sampleRate * 2; [wav appendBytes:&byteRate length:4];
+        uint16_t blockAlign = 2; [wav appendBytes:&blockAlign length:2];
+        uint16_t bitsPerSample = 16; [wav appendBytes:&bitsPerSample length:2];
+        [wav appendBytes:"data" length:4];
+        [wav appendBytes:&dataSize length:4];
+
+        int16_t *pcm = (int16_t *)malloc(dataSize);
+        if (pcm) {
+            for (uint32_t i = 0; i < totalFrames; i++) {
+                float t = (float)i / (float)sampleRate;
+                float raw = 0.0f;
+
+                // 第一阶 (0.00s ~ 0.14s): iOS 27 灵动点亮基音 A5 (880Hz) + E6 (1318.5Hz) + A6 (1760Hz)
+                if (t < 0.14f) {
+                    float env1 = (t < 0.005f) ? (t / 0.005f) : ((t < 0.045f) ? 1.0f : expf(-(t - 0.045f) * 15.0f));
+                    raw += (sinf(2.0f * (float)M_PI * 880.00f * t) * 0.52f
+                          + sinf(2.0f * (float)M_PI * 1318.51f * t) * 0.36f
+                          + sinf(2.0f * (float)M_PI * 1760.00f * t) * 0.18f) * env1;
+                }
+                // 第二阶 (0.055s ~ 0.21s): 全息五度上扬 C#6 (1108.73Hz) + F#6 (1479.98Hz) + C#7 (2217.46Hz)
+                if (t >= 0.055f && t < 0.21f) {
+                    float t2 = t - 0.055f;
+                    float env2 = (t2 < 0.005f) ? (t2 / 0.005f) : ((t2 < 0.050f) ? 1.0f : expf(-(t2 - 0.050f) * 13.0f));
+                    raw += (sinf(2.0f * (float)M_PI * 1108.73f * t2) * 0.48f
+                          + sinf(2.0f * (float)M_PI * 1479.98f * t2) * 0.38f
+                          + sinf(2.0f * (float)M_PI * 2217.46f * t2) * 0.20f) * env2;
+                }
+                // 第三阶 (0.115s ~ 0.28s): iOS 27 星光高音晶簇绽放 E6 (1318.51Hz) + A6 (1760Hz) + E7 (2637Hz)
+                if (t >= 0.115f) {
+                    float t3 = t - 0.115f;
+                    float env3 = (t3 < 0.005f) ? (t3 / 0.005f) : ((t3 < 0.060f) ? 1.0f : expf(-(t3 - 0.060f) * 11.0f));
+                    raw += (sinf(2.0f * (float)M_PI * 880.00f * t3) * 0.24f
+                          + sinf(2.0f * (float)M_PI * 1318.51f * t3) * 0.46f
+                          + sinf(2.0f * (float)M_PI * 1760.00f * t3) * 0.42f
+                          + sinf(2.0f * (float)M_PI * 2637.02f * t3) * 0.22f) * env3;
+                }
+
+                // 使用 tanhf 软限幅谐波增响器将平均响度 (RMS) 推满 2.8 倍，低音量下依然清脆洪亮且不破音
+                float sample = tanhf(raw * 2.8f) * 0.98f;
+                pcm[i] = (int16_t)(sample * 32767.0f);
+            }
+            [wav appendBytes:pcm length:dataSize];
+            free(pcm);
+        }
+        sWavData = [wav copy];
+    });
+    return sWavData;
+}
+
+// 严格串行第 1 步：0.00s 立即以纯媒体满音量模式播放 0.28s 的 iOS 27 提示音；0.30s 播完瞬间无缝启动麦克风引擎
+- (void)playCrystalWakeupChimeIfNeeded {
+    if (!self.pendingWakeupChime || self.isDismissed) {
         return;
     }
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - self.lastChimePlayTimestamp < 0.55) {
-        agLiveDiagLog(@"CHIME_DIAG", @"Skipped: throttled (delta=%.2fs < 0.55s)", now - self.lastChimePlayTimestamp);
+    if (now - self.lastChimePlayTimestamp < 0.60) {
         self.pendingWakeupChime = NO;
         return;
     }
     self.pendingWakeupChime = NO;
     self.lastChimePlayTimestamp = now;
+    self.isPlayingWakeupChime = YES;
 
-    dispatch_async(self.audioPlayQueue, ^{
-        if (self.isDismissed || !self.liveAudioEngine || !self.pcmPlayerNode || !self.playerOutputFormat) {
-            agLiveDiagLog(@"CHIME_DIAG", @"Aborted in audioPlayQueue: engine or player released");
+    @try {
+        // 在麦克风 VoiceChat 模式启动前，先以 Playback 媒体模式播放提示音（绕过 VoiceChat 压音与静音键，声音洪亮饱满）
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        [session setCategory:AVAudioSessionCategoryPlayback
+                        mode:AVAudioSessionModeDefault
+                     options:AVAudioSessionCategoryOptionMixWithOthers
+                       error:nil];
+        [session setActive:YES error:nil];
+
+        NSData *wavData = agGetIOS27SiriChimeWAVData();
+        if (wavData.length > 44) {
+            self.wakeupChimePlayer = [[AVAudioPlayer alloc] initWithData:wavData error:nil];
+            self.wakeupChimePlayer.volume = 1.0f;
+            [self.wakeupChimePlayer prepareToPlay];
+            [self.wakeupChimePlayer play];
+            agLiveDiagLog(@"CHIME_PLAYED", @"Playing iOS 27 Siri chime first (0.28s full volume, mic queued)");
+        }
+    } @catch (NSException *e) {
+        agLiveDiagLog(@"CHIME_ERR", @"Exception playing chime: %@", e.reason);
+    }
+
+    // 0.30s 提示音播放完毕瞬间：立即释放提示音播放器，并无缝启动你原装的 FullDuplex 麦克风语音引擎！
+    NSUInteger chimeToken = self.sessionGenerationToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self.wakeupChimePlayer) {
+            [self.wakeupChimePlayer stop];
+            self.wakeupChimePlayer = nil;
+        }
+        self.isPlayingWakeupChime = NO;
+        if (self.isDismissed || !self.overlayWindow || self.overlayWindow.hidden) {
+            self.pendingAudioEngineStartAfterChime = NO;
             return;
         }
-
-        AVAudioSession *sess = [AVAudioSession sharedInstance];
-        float sysVol = sess.outputVolume;
-        AVAudioSessionPortDescription *outPort = sess.currentRoute.outputs.firstObject;
-        NSString *portName = outPort ? [NSString stringWithFormat:@"%@(%@)", outPort.portType, outPort.portName] : @"none";
-
-        // 低音量硬件托底补偿：若手机当前音量过低 (< 0.52)，在提示音 0.48s 期间临时托底提升硬件音量，播完立即原样恢复
-        Class avSysCls = objc_getClass("AVSystemController");
-        id avsc = (avSysCls && [avSysCls respondsToSelector:@selector(sharedAVSystemController)]) ? [avSysCls sharedAVSystemController] : nil;
-        float savedVol = sysVol;
-        BOOL didBoostSysVol = NO;
-        if (avsc && [avsc respondsToSelector:@selector(getVolume:forCategory:)] && [avsc respondsToSelector:@selector(setVolumeTo:forCategory:)]) {
-            float catVol = sysVol;
-            if ([avsc getVolume:&catVol forCategory:@"Audio/Video"] && catVol > 0.01f && catVol < 0.52f) {
-                savedVol = catVol;
-                float targetBoostVol = MIN(0.65f, catVol + 0.28f);
-                [avsc setVolumeTo:targetBoostVol forCategory:@"Audio/Video"];
-                didBoostSysVol = YES;
-            }
+        if (self.pendingAudioEngineStartAfterChime || (self.activeModeTab != AGConfigTabPureText && chimeToken == self.sessionGenerationToken)) {
+            self.pendingAudioEngineStartAfterChime = NO;
+            agLiveDiagLog(@"CHIME_DIAG", @"iOS 27 chime finished (0.30s), now starting FullDuplex Mic Engine");
+            [self setupAndStartFullDuplexPCMAudioEngine];
         }
-
-        // 根据系统音量动态计算数字前级推力：音量越低，tanhf 软限幅谐波增响推力越大（最高 3.4 倍增益）
-        float digitalDrive = (sysVol < 0.35f) ? 3.4f : ((sysVol < 0.60f) ? 2.6f : 2.0f);
-
-        double sampleRate = self.playerOutputFormat.sampleRate > 0 ? self.playerOutputFormat.sampleRate : 48000.0;
-        AVAudioChannelCount channels = MAX(1, self.playerOutputFormat.channelCount);
-        // 总时长 0.52s：前 0.16s 为破除 VoiceProcessingIO 硬件静音门限的预热帧，后 0.36s 为 iOS 27 三阶全息水晶音
-        AVAudioFrameCount totalFrames = (AVAudioFrameCount)(sampleRate * 0.52);
-
-        AVAudioPCMBuffer *chimeBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:self.playerOutputFormat frameCapacity:totalFrames];
-        chimeBuf.frameLength = totalFrames;
-
-        float maxPeak = 0.0f;
-        for (AVAudioFrameCount i = 0; i < totalFrames; i++) {
-            float t = (float)i / (float)sampleRate;
-            float raw = 0.0f;
-
-            if (t < 0.16f) {
-                // 0.00s ~ 0.16s: 极微弱导频信号，提前顶开 iOS 硬件回声消除功放门限，防止首音被吞
-                raw = sinf(2.0f * (float)M_PI * 1000.0f * t) * 0.003f;
-            } else {
-                float tc = t - 0.16f;
-                // 第一阶 (0.00s ~ 0.16s): iOS 27 灵动点亮基音 A5 (880Hz) + E6 (1318.5Hz)
-                if (tc >= 0.0f && tc < 0.18f) {
-                    float env1 = (tc < 0.005f) ? (tc / 0.005f) : ((tc < 0.055f) ? 1.0f : expf(-(tc - 0.055f) * 14.0f));
-                    raw += (sinf(2.0f * (float)M_PI * 880.00f * tc) * 0.52f
-                          + sinf(2.0f * (float)M_PI * 1318.51f * tc) * 0.36f
-                          + sinf(2.0f * (float)M_PI * 1760.00f * tc) * 0.18f) * env1;
-                }
-                // 第二阶 (0.065s ~ 0.25s): 全息五度跃迁 C#6 (1108.73Hz) + F#6 (1479.98Hz) + C#7 (2217.46Hz)
-                if (tc >= 0.065f && tc < 0.26f) {
-                    float t2 = tc - 0.065f;
-                    float env2 = (t2 < 0.005f) ? (t2 / 0.005f) : ((t2 < 0.060f) ? 1.0f : expf(-(t2 - 0.060f) * 12.0f));
-                    raw += (sinf(2.0f * (float)M_PI * 1108.73f * t2) * 0.48f
-                          + sinf(2.0f * (float)M_PI * 1479.98f * t2) * 0.38f
-                          + sinf(2.0f * (float)M_PI * 2217.46f * t2) * 0.20f) * env2;
-                }
-                // 第三阶 (0.135s ~ 0.36s): iOS 27 星光高音晶簇绽放 E6 (1318.51Hz) + A6 (1760Hz) + E7 (2637Hz)
-                if (tc >= 0.135f) {
-                    float t3 = tc - 0.135f;
-                    float env3 = (t3 < 0.006f) ? (t3 / 0.006f) : ((t3 < 0.075f) ? 1.0f : expf(-(t3 - 0.075f) * 9.5f));
-                    raw += (sinf(2.0f * (float)M_PI * 880.00f * t3) * 0.25f
-                          + sinf(2.0f * (float)M_PI * 1318.51f * t3) * 0.46f
-                          + sinf(2.0f * (float)M_PI * 1760.00f * t3) * 0.42f
-                          + sinf(2.0f * (float)M_PI * 2637.02f * t3) * 0.22f) * env3;
-                }
-                // 通过 tanhf 软限幅增响器将平均响度 (RMS) 推满且绝不破音
-                raw = tanhf(raw * digitalDrive) * 0.96f;
-            }
-
-            float sample = MAX(-0.98f, MIN(0.98f, raw));
-            if (fabsf(sample) > maxPeak) maxPeak = fabsf(sample);
-            for (AVAudioChannelCount ch = 0; ch < channels; ch++) {
-                if (chimeBuf.floatChannelData && chimeBuf.floatChannelData[ch]) {
-                    chimeBuf.floatChannelData[ch][i] = sample;
-                }
-            }
-        }
-
-        NSError *engErr = nil;
-        if (!self.liveAudioEngine.isRunning) {
-            [self.liveAudioEngine startAndReturnError:&engErr];
-        }
-        if (!self.pcmPlayerNode.isPlaying) {
-            [self.pcmPlayerNode play];
-        }
-        self.pcmPlayerNode.volume = 1.0f;
-        self.liveAudioEngine.mainMixerNode.outputVolume = 1.0f;
-
-        agLiveDiagLog(@"CHIME_DIAG", @"Scheduled iOS 27 chime on pcmPlayerNode (sysVol=%.2f, boosted=%d, drive=%.1f, outPort=%@, engRun=%d, playerPlay=%d, rate=%.0f, ch=%u, peak=%.2f, engErr=%@)",
-                      sysVol, didBoostSysVol, digitalDrive, portName, self.liveAudioEngine.isRunning, self.pcmPlayerNode.isPlaying,
-                      sampleRate, (unsigned int)channels, maxPeak, engErr.localizedDescription ?: @"none");
-
-        NSTimeInterval schedTime = [[NSDate date] timeIntervalSince1970];
-        __weak typeof(self) weakSelf = self;
-        [self.pcmPlayerNode scheduleBuffer:chimeBuf completionHandler:^{
-            if (didBoostSysVol && avsc) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [avsc setVolumeTo:savedVol forCategory:@"Audio/Video"];
-                });
-            }
-            NSTimeInterval costMs = ([[NSDate date] timeIntervalSince1970] - schedTime) * 1000.0;
-            agLiveDiagLog(@"CHIME_DIAG", @"iOS 27 chime playback finished (elapsed=%.0fms, engRun=%d, playerPlay=%d)",
-                          costMs, (weakSelf.liveAudioEngine && weakSelf.liveAudioEngine.isRunning), (weakSelf.pcmPlayerNode && weakSelf.pcmPlayerNode.isPlaying));
-        }];
-        agLiveDiagLog(@"CHIME_PLAYED", @"Played iOS 27 Siri crystal chime on pcmPlayerNode");
     });
 }
 
+// 严格串行第 2 步：若提示音正在播放则排队等待 0.30s；提示音一结束立即按原装逻辑启动麦克风
 - (void)setupAndStartFullDuplexPCMAudioEngine {
+    if (self.pendingWakeupChime && !self.isPlayingWakeupChime) {
+        [self playCrystalWakeupChimeIfNeeded];
+    }
+    if (self.isPlayingWakeupChime) {
+        self.pendingAudioEngineStartAfterChime = YES;
+        agLiveDiagLog(@"CHIME_DIAG", @"Mic engine queued: waiting for 0.28s chime to finish first");
+        return;
+    }
+
     NSUInteger expectedToken = self.sessionGenerationToken;
     dispatch_async(agAudioSerialQueue(), ^{
         if (self.isDismissed || expectedToken != self.sessionGenerationToken) return;
@@ -6422,9 +6417,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 if (!self.pcmPlayerNode.isPlaying) {
                     [self.pcmPlayerNode play];
                 }
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self playCrystalWakeupChimeIfNeeded];
-                });
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Reusing active FullDuplex Engine (rate=%.0f)", self.playerOutputFormat.sampleRate);
                 return;
             }
@@ -6492,10 +6484,6 @@ static void agScreenWakePrewarmCallback(CFNotificationCenterRef center, void *ob
                 self.liveAudioEngine = engine;
                 self.pcmPlayerNode = player;
                 self.playerOutputFormat = mixerFormat;
-                // 引擎启动瞬间立即派发提示音（提示音内部自带 0.16s 硬件解静音预热导频，无需再等 0.38s）
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self playCrystalWakeupChimeIfNeeded];
-                });
                 agLiveDiagLog(@"AEC_AUDIO_ENGINE", @"Started FullDuplex Engine (inRate=%.0f, outRate=%.0f, vpErr=%@)", tapFormat.sampleRate, mixerFormat.sampleRate, vpErr.localizedDescription ?: @"none");
             } else {
                 agLiveDiagLog(@"AUDIO_ERR", @"AVAudioEngine start error: %@", startErr.localizedDescription);
